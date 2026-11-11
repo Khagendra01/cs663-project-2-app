@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Sequence mode - Start Sequence"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="The app watches the dog over time: one frame per second goes to the fine-tuned model, and a temporal state machine judges the whole attempt (SUCCESS / EARLY BREAK / UNCERTAIN), not just one photo."
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Backend URL" />
+
+        <EditText
+            android:id="@+id/etSeqUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textUri"
+            android:textSize="13sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Command"
+            android:layout_marginTop="12dp" />
+
+        <Spinner
+            android:id="@+id/spCommand"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Stay posture (only used when the command is Stay)"
+            android:layout_marginTop="8dp" />
+
+        <Spinner
+            android:id="@+id/spStayPosture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Target duration"
+            android:layout_marginTop="8dp" />
+
+        <Spinner
+            android:id="@+id/spDuration"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextureView
+            android:id="@+id/texturePreview"
+            android:layout_width="match_parent"
+            android:layout_height="320dp"
+            android:layout_marginTop="16dp"
+            android:background="#000000" />
+
+        <TextView
+            android:id="@+id/tvSeqCurrent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Current posture: -"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:layout_marginTop="12dp" />
+
+        <ProgressBar
+            android:id="@+id/progressSeq"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:id="@+id/tvSeqProgress"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Not running."
+            android:layout_marginTop="8dp" />
+
+        <Button
+            android:id="@+id/btnStartSeq"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="START SEQUENCE"
+            android:layout_marginTop="12dp" />
+
+        <Button
+            android:id="@+id/btnStopSeq"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="STOP"
+            android:enabled="false" />
+
+        <TextView
+            android:id="@+id/tvSeqStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Camera preview starts when permission is granted."
+            android:layout_marginTop="12dp" />
+
+        <LinearLayout
+            android:id="@+id/layoutVerdict"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginTop="20dp">
+
+            <TextView
+                android:id="@+id/tvSeqVerdict"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Verdict"
+                android:textSize="26sp"
+                android:textStyle="bold"
+                android:background="#FFF3E0"
+                android:padding="12dp" />
+
+            <TextView
+                android:id="@+id/tvSeqDetails"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:background="#EEEEEE"
+                android:padding="12dp"
+                android:layout_marginTop="8dp" />
+
+            <Button
+                android:id="@+id/btnFeedback"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Get trainer feedback"
+                android:layout_marginTop="12dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Trainer feedback (base Gemini)"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                android:layout_marginTop="16dp" />
+
+            <TextView
+                android:id="@+id/tvSeqFeedback"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="(no feedback yet)"
+                android:background="#E8F5E9"
+                android:padding="12dp" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>
