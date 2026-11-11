@@ -116,8 +116,7 @@ Verified against the live deployment on Nov 10, 2026:
 - `POST /api/fine-tuned-gemini`, same photo → "lying down" ✓
 - Live sequence proof (offline harness driving the same endpoints the app
   uses): 7 frames of a standing dog from a 3.6s clip, target 8s → all frames
-  classified standing, state machine verdict **UNCERTAIN — held 3.0s of the
-  8s target, interval incomplete** (GitHub A,
+  classified standing, state machine verdict **UNCERTAIN — interval incomplete** (held time is time-base dependent: 3.0s at the stored 2 fps, 6.0s at the app's 1 fps; see GitHub A video_evaluation.md) (GitHub A,
   `video-sequence-layer/results/live_seq06_tuned.json`).
 
 Accuracy summary (full testing documentation in GitHub A, `TESTING.md`):
