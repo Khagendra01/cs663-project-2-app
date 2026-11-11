@@ -19,7 +19,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="The app watches the dog over time: one frame per second goes to the fine-tuned model, and a temporal state machine judges the whole attempt (SUCCESS / EARLY BREAK / UNCERTAIN), not just one photo."
+            android:text="The app watches the dog over time: one frame per second goes to the fine-tuned model, and a temporal state machine judges the whole attempt (SUCCESS / EARLY BREAK / UNCERTAIN), not just one photo. START stays disabled until the dog is in the required starting posture (Sit starts from standing, Down from sitting) - the app shows Ready when it is."
             android:layout_marginBottom="16dp" />
 
         <TextView
@@ -102,6 +102,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="START SEQUENCE"
+            android:enabled="false"
             android:layout_marginTop="12dp" />
 
         <Button

@@ -30,28 +30,49 @@ import java.util.Map;
 // Smoothing is a majority vote over a sliding window of raw labels, so
 // one wrong frame never flips a verdict, and a break must be sustained.
 //
+// Updated proposal (Oct 26, 2026) rules implemented here:
+//   - Two command shapes. HOLD commands (Stay / Stand / Walk): reach
+//     the target (settle grace 2 frames) and hold it for the full
+//     target duration. REACH-THEN-HOLD commands (Sit / Down): the dog
+//     must REACH the target within a 3.0s response window (RESPONSE
+//     phase), then HOLD it for 0.6s (HOLD phase). If the window
+//     expires unreached, the verdict is EARLY_BREAK with held 0s -
+//     the dog failed the command, it did not merely run out of time.
+//   - Break timestamp = the FIRST raw observation of the wrong
+//     posture, not the confirmation frame (proposal 5.3). The smoother
+//     lags the raw stream, so the break is timestamped when the dog
+//     actually moved, and held time is measured to that frame. The
+//     Python reference implements the same rule; a single wrong raw
+//     frame the smoother votes down is forgotten as soon as a raw
+//     frame shows the dog back in the target posture.
+//   - Lost / unclear: 2 consecutive no-label frames end the attempt
+//     as UNCERTAIN (proposal 5.3: lost/occluded for >1.0s).
+//
 // 1 FPS MAPPING (SequenceActivity samples one frame per second):
-// in the Python file the config values are seconds AND the harness feeds
-// it 2 fps streams, while here frames arrive at 1 fps. We keep the same
-// numeric values and feed t = frame index, so 1 frame step = 1 second
-// of sequence time and every constant means the same number of frames
-// as seconds:
+// the proposal assumes ~5 fps analysis; the live loop cannot do that
+// because each frame is a cloud call (~1s+ round trip), so the app
+// samples at 1 fps and every proposal time is mapped to frames:
 //   smooth window 3 frames   (sequence_evaluate.py runs the Python with
 //                             smooth_window=3; the Python dataclass
-//                             default of 5 would lag too much at 1 fps)
+//                             default of 5, and the proposal's 5, would
+//                             lag half of a 5s stay at 1 fps -
+//                             deliberately NOT changed to 5)
 //   settle grace 2           target must appear within the first 2 frames
+//   response window 3        Sit/Down: 3 frames to reach the target
+//   hold after reach 1       Sit/Down: 1 more frame (~0.6s at 5 fps)
 //   break confirm 1          1 further smoothed non-target frame confirms
 //                            a break that started 1 frame ago (same 1s
 //                            rule: break time is when it started)
-//   uncertain timeout 3      3 unclear frames in a row while holding
-//                            -> UNCERTAIN
+//   lost frames 2            2 no-label frames in a row -> UNCERTAIN
 //   max uncertain ratio 0.4  checked in finish(), same as Python
 //
 // One real difference from Python: the Gemini endpoints return only a
-// text label, no confidence, so min_confidence never triggers here.
-// A frame whose reply cannot be parsed, or whose network call failed,
-// is fed as a no-label frame - exactly how Python treats a frame with
-// no dog / an unknown label (UNCERTAIN_FRAME).
+// text label, no confidence, so min_confidence never triggers here
+// and the proposal's "<0.65 confidence -> Undefined" rule cannot be
+// applied - there is no score to threshold (see parseLabel() in
+// SequenceActivity). A frame whose reply cannot be parsed, or whose
+// network call failed, is fed as a no-label frame - exactly how Python
+// treats a frame with no dog / an unknown label (UNCERTAIN_FRAME).
 public class SequenceSession {
 
     public static final String UNCERTAIN_FRAME = "uncertain_frame";
@@ -81,15 +102,23 @@ public class SequenceSession {
         }
     }
 
-    // SessionConfig from the Python file, with the values above.
+    // SessionConfig from the Python file, with the values above, plus
+    // the updated proposal's response-window shape (Sit/Down only).
     public static class Config {
         public double targetDurationS;
         public double minConfidence = 0.6;   // unused here (no scores)
         public int smoothWindow = 3;         // frames (see header)
         public double settleGraceS = 2.0;    // frames at 1 fps
         public double breakConfirmS = 1.0;   // frames at 1 fps
-        public double uncertainTimeoutS = 3.0; // frames at 1 fps
+        public int lostFrames = 2;           // consecutive no-label frames
+                                             // -> UNCERTAIN (see header)
         public double maxUncertainRatio = 0.4;
+        // Sit/Down shape (proposal 5.2): reach the target within
+        // responseWindowS, then hold it for holdAfterReachS. At 1 fps
+        // the 0.6s hold is 1 frame.
+        public boolean reachThenHold = false;
+        public double responseWindowS = 3.0; // frames at 1 fps
+        public double holdAfterReachS = 1.0; // frames at 1 fps
 
         public Config(double targetDurationS) {
             this.targetDurationS = targetDurationS;
@@ -164,7 +193,13 @@ public class SequenceSession {
     private Verdict verdict = null;
     private Double reachedAt = null;
     private Double breakSince = null;
-    private Double uncertainSince = null;
+    // t of the first RAW (unsmoothed) wrong-posture observation while
+    // holding; becomes breakAtS if the break confirms (proposal 5.3).
+    // Reset only when a raw frame shows the dog back in the target -
+    // never on a smoothed target alone, because the smoother lags the
+    // raw stream and would erase the break's true start time.
+    private Double pendingBreakStart = null;
+    private int consecutiveUncertain = 0;
     private Double lastT = null;
     private int n = 0;
     private int nUncertain = 0;
@@ -194,27 +229,59 @@ public class SequenceSession {
         if (verdict != null) return verdict;
         n++;
         lastT = t;
+        // The raw label, if it is a usable observation at all - this is
+        // what the break timestamp is taken from (proposal 5.3), before
+        // smoothing delays it.
+        String raw = canonicalLabel(label);
+        if (!dogPresent || raw.equals(UNCERTAIN_FRAME)
+                || (confidence != null && confidence < cfg.minConfidence)) {
+            raw = UNCERTAIN_FRAME;
+        }
         String smoothed = smoother.push(label, confidence, dogPresent);
         lastSmoothed = smoothed;
         if (smoothed.equals(UNCERTAIN_FRAME)) nUncertain++;
         seq.add(String.format(Locale.US, "%.0f %s", t, smoothed));
 
-        // Lost / unclear for too long -> UNCERTAIN (only while tracking;
-        // before the target is reached the settle grace governs instead).
+        // Lost / unclear for too long -> UNCERTAIN. Proposal 5.3:
+        // lost/occluded for >1.0s; at 1 fps that is 2 consecutive
+        // no-label frames. Applies in any phase - an attempt that
+        // cannot be seen cannot be judged.
         if (smoothed.equals(UNCERTAIN_FRAME)) {
-            if (uncertainSince == null) uncertainSince = t;
-            if (reachedAt != null && t - uncertainSince >= cfg.uncertainTimeoutS) {
+            consecutiveUncertain++;
+            if (consecutiveUncertain >= cfg.lostFrames) {
                 return make("UNCERTAIN",
-                        "dog lost / unclear for " + fmt0(cfg.uncertainTimeoutS)
-                                + "s during the hold", null, null);
+                        "dog lost / unclear for " + cfg.lostFrames
+                                + " frames in a row - cannot judge the attempt",
+                        null, null);
             }
         } else {
-            uncertainSince = null;
+            consecutiveUncertain = 0;
+        }
+
+        // First raw sighting of a wrong posture during the hold.
+        // (Before the target is reached the dog is simply not there
+        // yet, so nothing is recorded.)
+        if (reachedAt != null && !raw.equals(UNCERTAIN_FRAME)
+                && !raw.equals(target) && pendingBreakStart == null) {
+            pendingBreakStart = t;
         }
 
         if (reachedAt == null) {
             if (smoothed.equals(target)) {
                 reachedAt = t;
+            } else if (cfg.reachThenHold) {
+                // RESPONSE phase (Sit/Down, proposal 5.2): the dog must
+                // reach the target within the response window. t is the
+                // frame index at 1 fps, so t >= 3 means the 3 frames
+                // t=0,1,2 passed without it. Missing the window is a
+                // failed command, hence EARLY_BREAK with held 0s -
+                // not UNCERTAIN.
+                if (t >= cfg.responseWindowS) {
+                    return make("EARLY_BREAK",
+                            "target posture '" + target + "' not reached within the "
+                                    + fmt0(cfg.responseWindowS) + "s response window",
+                            null, 0.0);
+                }
             } else if (t >= cfg.settleGraceS) {
                 return make("UNCERTAIN",
                         "target posture '" + target + "' never established within the "
@@ -226,7 +293,21 @@ public class SequenceSession {
         // Tracking the hold.
         if (smoothed.equals(target)) {
             breakSince = null;
-            if (t - reachedAt >= cfg.targetDurationS) {
+            // A wrong raw frame the smoother voted down is a glitch:
+            // forget it only once a RAW frame shows the dog back in the
+            // target posture (see the pendingBreakStart comment above).
+            if (raw.equals(target)) {
+                pendingBreakStart = null;
+            }
+            double holdNeeded = holdRequiredS();
+            if (t - reachedAt >= holdNeeded) {
+                if (cfg.reachThenHold) {
+                    return make("SUCCESS",
+                            "reached '" + target + "' within the "
+                                    + fmt0(cfg.responseWindowS) + "s response window and held it "
+                                    + "for the 0.6s confirmation hold (1 frame at 1 fps)",
+                            null, null);
+                }
                 return make("SUCCESS",
                         "held '" + target + "' for the full " + fmt0(cfg.targetDurationS)
                                 + "s target duration", null, null);
@@ -237,14 +318,44 @@ public class SequenceSession {
         if (!smoothed.equals(UNCERTAIN_FRAME)) {
             if (breakSince == null) breakSince = t;
             if (t - breakSince >= cfg.breakConfirmS) {
+                // Break timestamp = first raw sighting of the wrong
+                // posture (proposal 5.3), not the confirmation frame.
+                double breakAt = pendingBreakStart != null
+                        ? pendingBreakStart : breakSince;
+                if (cfg.reachThenHold) {
+                    return make("EARLY_BREAK",
+                            "reached '" + target + "' but left it after holding "
+                                    + fmt1(breakAt - reachedAt) + "s of the 0.6s "
+                                    + "confirmation hold",
+                            breakAt, breakAt - reachedAt);
+                }
                 return make("EARLY_BREAK",
                         "left '" + target + "' after holding "
-                                + fmt1(breakSince - reachedAt) + "s of the "
+                                + fmt1(breakAt - reachedAt) + "s of the "
                                 + fmt0(cfg.targetDurationS) + "s target",
-                        breakSince, breakSince - reachedAt);
+                        breakAt, breakAt - reachedAt);
             }
         }
         return null;
+    }
+
+    // How long the target must be held once reached: the full target
+    // duration for HOLD commands, the 0.6s confirmation hold (1 frame
+    // at 1 fps) for REACH-THEN-HOLD commands.
+    public double holdRequiredS() {
+        return cfg.reachThenHold ? cfg.holdAfterReachS : cfg.targetDurationS;
+    }
+
+    // Current phase, for the live UI: RESPONSE (Sit/Down, target not
+    // yet reached) or HOLD (target reached, confirming the hold).
+    public String getPhase() {
+        if (verdict != null) return "DONE";
+        if (!cfg.reachThenHold) return "HOLD";
+        return reachedAt == null ? "RESPONSE" : "HOLD";
+    }
+
+    public boolean isReachThenHold() {
+        return cfg.reachThenHold;
     }
 
     // finish() from the Python file: verdict for an interval that ended
@@ -261,6 +372,12 @@ public class SequenceSession {
             return make("UNCERTAIN",
                     "target posture '" + target + "' was never established",
                     null, null);
+        }
+        if (cfg.reachThenHold) {
+            return make("UNCERTAIN",
+                    "interval ended after holding " + fmt1(lastT - reachedAt)
+                            + "s of the 0.6s confirmation hold - "
+                            + "incomplete, not a success and not a break", null, null);
         }
         return make("UNCERTAIN",
                 "interval ended after holding " + fmt1(lastT - reachedAt) + "s of the "
