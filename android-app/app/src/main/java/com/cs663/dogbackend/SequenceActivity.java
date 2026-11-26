@@ -1,197 +1,277 @@
 package com.cs663.dogbackend;
 
 import android.Manifest;
-import android.annotation.SuppressLint;
-import android.app.Activity;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.ImageFormat;
-import android.graphics.SurfaceTexture;
-import android.hardware.camera2.CameraAccessException;
-import android.hardware.camera2.CameraCaptureSession;
-import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.CameraDevice;
-import android.hardware.camera2.CameraManager;
-import android.hardware.camera2.CaptureRequest;
-import android.hardware.camera2.params.StreamConfigurationMap;
-import android.media.Image;
-import android.media.ImageReader;
+import android.graphics.Color;
+import android.graphics.Matrix;
+import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.HandlerThread;
-import android.util.Base64;
+import android.os.SystemClock;
 import android.util.Size;
+import android.view.OrientationEventListener;
 import android.view.Surface;
-import android.view.TextureView;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import androidx.activity.ComponentActivity;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.core.resolutionselector.AspectRatioStrategy;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.content.FileProvider;
+
+import com.google.common.util.concurrent.ListenableFuture;
+
+import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
-// Sequence mode: the Project 2 core. Instead of judging one photo, the
-// app judges a command over TIME, following the updated proposal
-// (Oct 26, 2026) sections 3, 5 and 7:
+// Sequence mode: the Project 2 Dog Training Assistant.
 //
-// How it works:
-//   0. READY gate (proposal 5.2): START SEQUENCE starts disabled. While
-//      this screen is open, a readiness sampler classifies one frame
-//      per second and shows the live posture. Start enables only once
-//      the required starting posture is observed stable - Sit starts
-//      from Stand, Down starts from Sit, Stay/Stand start from the
-//      selected posture (Walk has no starting-posture requirement; it
-//      is outside the proposal's MVP table). At 1 fps, "stable >=0.6s"
-//      maps to 1 confirmed (smoothed) frame of the required posture.
-//      The moment the trainer taps Start is t=0.
-//   1. The trainer picks a command (Sit / Down / Stand / Stay / Walk)
-//      and a target duration (Stay default 5s), then taps START SEQUENCE.
-//   2. The camera (Camera2, live preview on a TextureView) also streams
-//      JPEG frames into an ImageReader. Once per second the sampler
-//      takes the newest frame, shrinks it to ~640px wide, and POSTs it
-//      to /api/fine-tuned-gemini with the fixed posture prompt.
-//   3. Each reply is parsed to a canonical label and fed into
-//      SequenceSession - the Java port of the Python temporal state
-//      machine in files/video-sequence-layer/state_machine.py - which
-//      decides SUCCESS / EARLY_BREAK / UNCERTAIN with smoothing, a
-//      settle grace / response window, and a sustained-break rule.
-//      Sit/Down run as RESPONSE then HOLD: reach the target within
-//      3.0s, then hold it 0.6s (1 frame at 1 fps).
-//   4. When a verdict is decided, the app asks the base model
-//      (/api/gemini) for feedback as a JSON object (proposal 7):
-//      the prompt carries the command, target duration and the
-//      timestamped posture timeline - but NOT the engine's verdict
-//      and NOT the break time, so Model B judges the evidence
-//      independently. If the model's status disagrees with the local
-//      verdict, or the reply cannot be parsed, the LOCAL verdict
-//      stands with a deterministic template tip; the model's verdict
-//      is never displayed over the local one.
-//   The app stays native Android (owner decision, Nov 11): no Flutter
-//   rebuild - the outcome is the same working app, and the proposal's
-//   ~5 fps analysis rate is mapped to 1 fps here because each frame
-//   is a cloud call (~1s+ round trip). The mapping is documented in
-//   SequenceSession's header comment, not hidden.
-public class SequenceActivity extends Activity {
+// The trainer puts the phone on a tripod, picks a command (Sit / Down /
+// Stand / Stay / Walk) and taps START when the app says Ready. The app
+// watches the dog and judges the whole attempt: SUCCESS, EARLY_BREAK or
+// UNCERTAIN, with the time the dog broke, spoken out loud.
+//
+// THE INTEGRATED SYSTEM (one pipeline, three models):
+//
+//   CameraX ImageAnalysis, upright 640x480 frames, ~5 fps
+//     |
+//     v  [phone]  Model C  EfficientDet-Lite0 (pretrained, COCO)
+//     |           -> is there a dog? where? (box, tracked between frames)
+//     v  [phone]  ROI crop around the box (padded)
+//     v  [phone]  Model A  our fine-tuned MobileNetV3Small (TFLite)
+//     |           -> posture + confidence for the crop
+//     v  [phone]  temporal state machine (SequenceSession)
+//     |           smoothing, 0.65 confidence rule, response window,
+//     |           hold timer, break detection, real wall-clock seconds
+//     v           VERDICT (spoken + vibration + on screen)
+//     |
+//     v  [cloud]  Model B  our fine-tuned Gemini (Vertex endpoint via
+//     |           Cloud Run): re-checks the decisive frames (target
+//     |           reached / first wrong posture / last frame) against
+//     |           what the VERDICT claims about each of them ->
+//     |           VERIFIED / DISPUTED / PARTLY CHECKED / NOT CHECKED.
+//     |           Also asked during the READY gate when Model A stays
+//     |           unsure.
+//     v  [cloud]  base Gemini: coaching tip from verdict + timeline +
+//                 the decisive frame.
+//
+// The on-device verdict never waits on the network: if the backend is
+// down, the verdict still shows, marked "not checked by Model B".
+public class SequenceActivity extends ComponentActivity {
 
     public static final String EXTRA_BACKEND_URL = "backendUrl";
 
-    // Fixed prompt for every frame, identical to the dataset prompt.
-    private static final String FRAME_PROMPT =
-            "Look at the image of the dog. What is the dog doing? "
-                    + "Answer with exactly one of: sitting, standing, lying down, walking.";
-
     private static final int REQ_CAMERA_PERM = 77;
+    private static final long MIN_FRAME_INTERVAL_MS = 180;   // ~5 fps cap
+    private static final double MIN_CONF = 0.65;             // proposal 5.3
+    private static final long READY_STABLE_MS = 600;         // proposal 5.2
+    private static final long ESCALATE_AFTER_MS = 2000;      // A unsure this long -> ask B
+    private static final long ESCALATE_EVERY_MS = 6000;
+    private static final long B_READY_VALID_MS = 5000;       // counted from the reply's arrival
+    private static final int ROTATION_HYSTERESIS_DEG = 15;   // see quantizeRotation()
+    private static final int KEYFRAME_MAX_SIDE = 320;
+    private static final int MAX_KEYFRAMES = 600;
 
     private static final String[] COMMANDS = {"Sit", "Down", "Stand", "Stay", "Walk"};
-    private static final String[] STAY_POSTURES = {"Sitting", "Lying down", "Standing"};
-    private static final String[] DURATIONS = {"5 seconds", "10 seconds", "20 seconds"};
+    private static final String[] STAY_POSTURES = {"Stay: sitting", "Stay: lying down", "Stay: standing"};
+    private static final String[] STAY_LABELS = {"sitting", "lying_down", "standing"};
+    private static final String[] DURATIONS = {"5 s", "10 s", "20 s"};
     private static final int[] DURATION_SECONDS = {5, 10, 20};
 
     // UI
-    private EditText etSeqUrl;
-    private Spinner spCommand;
-    private Spinner spStayPosture;
-    private Spinner spDuration;
-    private TextureView texturePreview;
-    private TextView tvSeqCurrent;
-    private TextView tvSeqProgress;
+    private PreviewView previewView;
+    private OverlayView overlay;
+    private TextView tvSeqCurrent, tvTimer, tvFps, tvBanner;
+    private Spinner spCommand, spStayPosture, spDuration;
+    private Button btnStartSeq, btnStopSeq, btnFeedback, btnShareLog;
+    private TextView tvSeqStatus, tvSeqProgress, tvSeqVerdict, tvSeqDetails, tvModelB, tvSeqFeedback;
     private ProgressBar progressSeq;
-    private Button btnStartSeq;
-    private Button btnStopSeq;
-    private TextView tvSeqStatus;
     private LinearLayout layoutVerdict;
-    private TextView tvSeqVerdict;
-    private TextView tvSeqDetails;
-    private Button btnFeedback;
-    private TextView tvSeqFeedback;
+    private EditText etSeqUrl;
+    private CheckBox cbVoice;
 
-    // Camera2 state. The preview is live as soon as this screen opens
-    // (and permission is granted); START only starts the judging.
-    private CameraDevice cameraDevice;
-    private CameraCaptureSession captureSession;
-    private ImageReader imageReader;
-    private Surface previewSurface;
-    private HandlerThread cameraThread;
-    private Handler cameraHandler;
-    // Newest JPEG frame from the ImageReader, replaced as frames arrive.
-    private volatile byte[] latestJpeg;
+    // Threads. Everything below marked [A] is owned by the analysis
+    // thread and only touched there.
+    private final ExecutorService analysisExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService netPool = Executors.newCachedThreadPool();
+    private Cues cues;
 
-    // Sequence state.
-    private final ScheduledExecutorService sampler =
-            Executors.newSingleThreadScheduledExecutor();
-    private ScheduledFuture<?> sampleFuture;
-    private volatile boolean running = false;
+    // [A] models
+    private DogDetector detector;
+    private PostureClassifier classifier;
+    private VisionPipeline pipeline;
+    private long lastAnalysedMs = 0;
+    private long fpsWindowStart = 0;
+    private int fpsFrames = 0;
+
+    // [A] run state
     private SequenceSession session;
-    private int sampleIndex;              // next frame's t (1 fps: t == index)
-    private String runCommand;            // e.g. "Stay"
-    private String runTargetLabel;        // e.g. "sitting"
+    private long runT0Ms;
+    private String runCommand;
     private int runDurationSec;
-    private String backendBase;           // URL captured at START
-    private volatile String lastFrameB64; // last captured frame, for feedback
-    private SequenceSession.Verdict lastVerdict;
+    private final List<KeyFrame> keyframes = new ArrayList<>();
+    private FrameLog log;
+    private boolean reachedCued;
+    private final List<Long> frameLatencies = new ArrayList<>();
 
-    // READY-gate state (proposal 5.2). The readiness sampler runs while
-    // this screen is open and no sequence is running: it classifies one
-    // frame per second through the same smoother the session uses, and
-    // START enables only while the required starting posture is the
-    // current smoothed label. Changing the command or Stay posture
-    // resets the check.
-    private ScheduledFuture<?> readyFuture;
-    private volatile boolean readyRunning = false;
-    private volatile boolean readyGateOpen = false;
-    private volatile boolean paused = false;
+    // [A] READY gate
     private SequenceSession.TemporalSmoother readinessSmoother;
-    private String readyRequiredLabel;    // null = no requirement (Walk)
-    private volatile String readyLastSmoothed;
-    private volatile boolean readyFrameSeen = false;
+    private String readyLastSmoothed = SequenceSession.UNCERTAIN_FRAME; // [A] last detected-frame vote
+    private String readyRequired;          // null = any posture (Walk)
+    private Long readySinceMs;
+    // Detected (not held) frames since readySinceMs, and whether a detected
+    // frame has completed the stable span. See readinessStep.
+    private int readyDetectedFrames;
+    private boolean readyStable;
+    private Long unsureSinceMs;
+    private long lastEscalationMs;
+    private boolean gateOpen;
+    private String gateSource = "";
+    private volatile String bReadyLabel;   // Model B's answer for the READY gate
+    private volatile long bReadyAtMs;      // when that answer ARRIVED (nowMs clock)
+    private final AtomicBoolean bReadyInFlight = new AtomicBoolean(false);
+    // Bumped by every readiness reset (command change, attempt end,
+    // rotation change), so a Model B reply for a crop taken before the
+    // reset cannot open the gate for the new situation.
+    private final AtomicInteger readyGen = new AtomicInteger();
+
+    // Bumped by every cloud check and every START. Each cloud-check task
+    // only writes the result card while its generation is still current,
+    // so a slow reply for an earlier attempt cannot overwrite a newer
+    // attempt's card.
+    private final AtomicInteger cloudGen = new AtomicInteger();
+
+    // Orientation. The activity is locked to portrait, so CameraX's
+    // getRotationDegrees() only makes a frame upright relative to the
+    // SCREEN. On a phone clamped sideways on a tripod the dog would then
+    // be lying on its side in every frame - but Models C, A and B were
+    // all trained on upright photos. So the physical rotation is tracked
+    // here and the frame is turned the rest of the way to world-upright
+    // in analyze().
+    private OrientationEventListener orientationListener;
+    private volatile int deviceRotDeg = 0;   // [UI writes] 0/90/180/270, OrientationEventListener convention
+    private volatile int displayRotDeg = 0;  // [UI writes] display rotation of the portrait screen
+    private volatile boolean frontLens = false;
+    private int appliedExtraRotDeg = 0;      // [A] extra clockwise rotation used on the last frame
+    private int runExtraRotDeg = 0;          // [A] latched at START for the whole attempt
+
+    // Camera permission (UI thread only).
+    private boolean cameraStarted = false;
+    private boolean cameraDenied = false;
+    private boolean replayRequested = false;
+
+    // Replay clock: in replay mode every time-based rule runs on clip
+    // time (frame index / clipFps), not on how fast the phone replays.
+    private volatile long replayClockMs = 0;
+
+    // UI-thread mirrors
+    private volatile boolean running = false;
+    private volatile boolean modelsReady = false;
+    private volatile boolean uiGateOpen = false;
+    private volatile int selCommand = 0;   // spinner positions, set on the UI thread
+    private volatile int selStay = 0;
+
+    // Last finished attempt (for re-check / share)
+    private volatile SequenceSession.Verdict lastVerdict;
+    private volatile List<KeyFrame> lastKeyframes = new ArrayList<>();
+    private volatile String lastCommand;
+    private volatile int lastDuration;
+    private volatile FrameLog lastLog;
+
+    static class KeyFrame {
+        double t;
+        String label;      // Model A label fed to the machine (null = unclear)
+        float conf;
+        byte[] jpeg;       // small crop for Model B
+        String role;       // set when chosen as a decisive frame
+        // What the verdict claims about this frame: TRUE = the dog was in
+        // the target posture, FALSE = it was not, null = no claim (an
+        // UNCERTAIN verdict claims nothing). Model B is checked against
+        // this, not against Model A's label.
+        Boolean expectTarget;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_sequence);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        etSeqUrl = findViewById(R.id.etSeqUrl);
+        previewView = findViewById(R.id.previewView);
+        overlay = findViewById(R.id.overlay);
+        tvSeqCurrent = findViewById(R.id.tvSeqCurrent);
+        tvTimer = findViewById(R.id.tvTimer);
+        tvFps = findViewById(R.id.tvFps);
+        tvBanner = findViewById(R.id.tvBanner);
         spCommand = findViewById(R.id.spCommand);
         spStayPosture = findViewById(R.id.spStayPosture);
         spDuration = findViewById(R.id.spDuration);
-        texturePreview = findViewById(R.id.texturePreview);
-        tvSeqCurrent = findViewById(R.id.tvSeqCurrent);
-        tvSeqProgress = findViewById(R.id.tvSeqProgress);
-        progressSeq = findViewById(R.id.progressSeq);
         btnStartSeq = findViewById(R.id.btnStartSeq);
         btnStopSeq = findViewById(R.id.btnStopSeq);
+        btnFeedback = findViewById(R.id.btnFeedback);
+        btnShareLog = findViewById(R.id.btnShareLog);
         tvSeqStatus = findViewById(R.id.tvSeqStatus);
-        layoutVerdict = findViewById(R.id.layoutVerdict);
+        tvSeqProgress = findViewById(R.id.tvSeqProgress);
         tvSeqVerdict = findViewById(R.id.tvSeqVerdict);
         tvSeqDetails = findViewById(R.id.tvSeqDetails);
-        btnFeedback = findViewById(R.id.btnFeedback);
+        tvModelB = findViewById(R.id.tvModelB);
         tvSeqFeedback = findViewById(R.id.tvSeqFeedback);
+        progressSeq = findViewById(R.id.progressSeq);
+        layoutVerdict = findViewById(R.id.layoutVerdict);
+        etSeqUrl = findViewById(R.id.etSeqUrl);
+        cbVoice = findViewById(R.id.cbVoice);
+
+        previewView.setScaleType(PreviewView.ScaleType.FIT_CENTER);
+        previewView.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
+        progressSeq.setMax(100);
 
         String url = getIntent().getStringExtra(EXTRA_BACKEND_URL);
         etSeqUrl.setText(url == null || url.isEmpty() ? MainActivity.BACKEND_URL : url);
+        etSeqUrlText = etSeqUrl.getText().toString();
+        etSeqUrl.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence c, int a, int b, int d) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence c, int a, int b, int d) {
+            }
+
+            @Override
+            public void afterTextChanged(android.text.Editable e) {
+                etSeqUrlText = e.toString();
+            }
+        });
 
         spCommand.setAdapter(new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_dropdown_item, COMMANDS));
@@ -199,868 +279,1340 @@ public class SequenceActivity extends Activity {
                 android.R.layout.simple_spinner_dropdown_item, STAY_POSTURES));
         spDuration.setAdapter(new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_dropdown_item, DURATIONS));
-        spDuration.setSelection(0); // default 5 seconds (proposal 5.2)
 
-        // The READY gate owns the Start button: it starts disabled and
-        // is enabled only by the readiness sampler (see startReadiness).
-        btnStartSeq.setEnabled(false);
-
-        // Changing the command or the Stay posture changes the required
-        // starting posture, so the readiness check restarts from scratch.
-        // Sit/Down use the fixed 3s response window + 0.6s hold, so the
-        // duration spinner does not apply to them and is disabled.
-        android.widget.AdapterView.OnItemSelectedListener readyReset =
+        android.widget.AdapterView.OnItemSelectedListener reset =
                 new android.widget.AdapterView.OnItemSelectedListener() {
                     @Override
-                    public void onItemSelected(
-                            android.widget.AdapterView<?> parent, View view,
-                            int position, long id) {
-                        updateDurationEnabled();
-                        resetReadiness();
+                    public void onItemSelected(android.widget.AdapterView<?> p, View v, int pos, long id) {
+                        selCommand = spCommand.getSelectedItemPosition();
+                        selStay = spStayPosture.getSelectedItemPosition();
+                        updateSpinnersEnabled();
+                        requestReadinessReset();
                     }
 
                     @Override
-                    public void onNothingSelected(
-                            android.widget.AdapterView<?> parent) {
+                    public void onNothingSelected(android.widget.AdapterView<?> p) {
                     }
                 };
-        spCommand.setOnItemSelectedListener(readyReset);
-        spStayPosture.setOnItemSelectedListener(readyReset);
-        updateDurationEnabled();
+        spCommand.setOnItemSelectedListener(reset);
+        spStayPosture.setOnItemSelectedListener(reset);
+        updateSpinnersEnabled();
 
-        btnStartSeq.setOnClickListener(v -> startSequence());
-        btnStopSeq.setOnClickListener(v -> stopSequence(true));
+        cues = new Cues(this);
+        cbVoice.setOnCheckedChangeListener((b, on) -> cues.setVoiceOn(on));
+
+        // START stays ENABLED while the gate is closed (updateStartButton)
+        // and the gate is checked here instead: a disabled View gets no
+        // long-clicks, so disabling it would make the override below
+        // unreachable in exactly the case it exists for.
+        btnStartSeq.setOnClickListener(v -> {
+            if (!uiGateOpen) {
+                Toast.makeText(this, "Waiting for READY - long-press START to override",
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            startSequence(false);
+        });
+        // Long-press = start without the READY gate (e.g. the dog is in
+        // position but Model A keeps misreading it). Logged as such.
+        btnStartSeq.setOnLongClickListener(v -> {
+            if (!modelsReady || running) return false;
+            Toast.makeText(this, "Started without the READY check", Toast.LENGTH_SHORT).show();
+            startSequence(true);
+            return true;
+        });
+        btnStopSeq.setOnClickListener(v -> stopSequence());
         btnFeedback.setOnClickListener(v -> {
-            if (lastVerdict != null) fetchFeedback(lastVerdict);
+            if (lastVerdict != null) runCloudChecks(lastVerdict, lastKeyframes, lastCommand, lastDuration, lastLog);
+        });
+        btnShareLog.setOnClickListener(v -> shareLog());
+        findViewById(R.id.btnModelLab).setOnClickListener(v -> {
+            Intent i = new Intent(this, MainActivity.class);
+            i.putExtra(SequenceActivity.EXTRA_BACKEND_URL, etSeqUrl.getText().toString().trim());
+            startActivity(i);
         });
 
-        cameraThread = new HandlerThread("CameraThread");
-        cameraThread.start();
-        cameraHandler = new Handler(cameraThread.getLooper());
+        analysisExecutor.execute(this::loadModels);
 
-        startReadiness();
-
-        texturePreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+        orientationListener = new OrientationEventListener(this) {
             @Override
-            public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
-                ensureCameraPermissionThenOpen();
+            public void onOrientationChanged(int deg) {
+                // UNKNOWN = phone lying flat: keep the last rotation.
+                if (deg == ORIENTATION_UNKNOWN) return;
+                // deg is the device's clockwise rotation from its NATURAL
+                // orientation. The screen-upright frame is upright for the
+                // current display rotation (0 on a phone; 90/270 on a
+                // landscape-natural tablet locked to portrait), so take the
+                // rotation relative to the screen.
+                int rel = (deg + displayRotDeg) % 360;
+                deviceRotDeg = quantizeRotation(rel, deviceRotDeg);
             }
+        };
 
-            @Override
-            public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
-            }
+        // Debug builds only: replay a folder of frames through the exact
+        // same pipeline instead of the camera (used to test the app on the
+        // emulator and to evaluate recorded clips on a phone). See
+        // README "Replay mode".
+        //   am start -n com.cs663.dogbackend/.SequenceActivity --es replay <folder>
+        //       --ei cmd <0..4: Sit, Down, Stand, Stay, Walk>
+        //       --ei stay <0..2: sitting, lying down, standing>
+        //       --ef fps <playback speed, frames per wall-clock second>
+        //       --ef clipFps <rate the frames were extracted at; default = fps>
+        //       --ez autostart true
+        boolean debuggable = (getApplicationInfo().flags
+                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        String replay = getIntent().getStringExtra("replay");
+        if (debuggable && replay != null) {
+            replayRequested = true;
+            int cmd = getIntent().getIntExtra("cmd", 0);
+            int stay = getIntent().getIntExtra("stay", 0);
+            spCommand.setSelection(cmd);
+            spStayPosture.setSelection(stay);
+            selCommand = cmd;
+            selStay = stay;
+            // clipFps defaults to the playback fps, not to 2: before clipFps
+            // existed, "--ef fps 5" meant a 5 fps clip played in real time,
+            // and a fixed default of 2 would now stretch that clip's time
+            // 2.5x (breaking the 3 s window / hold rules) for old commands.
+            float fpsExtra = getIntent().getFloatExtra("fps", 2f);
+            float clipFpsExtra = getIntent().hasExtra("clipFps")
+                    ? getIntent().getFloatExtra("clipFps", fpsExtra) : fpsExtra;
+            android.util.Log.i("SequenceActivity", String.format(Locale.US,
+                    "Replay %s: playback fps=%.2f, clipFps=%.2f%s", replay, fpsExtra, clipFpsExtra,
+                    getIntent().hasExtra("clipFps") ? "" : " (defaulted to fps)"));
+            startReplay(replay, fpsExtra, clipFpsExtra,
+                    getIntent().getBooleanExtra("autostart", false));
+            return;
+        }
 
-            @Override
-            public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
-                closeCamera();
-                return true;
-            }
-
-            @Override
-            public void onSurfaceTextureUpdated(SurfaceTexture st) {
-            }
-        });
-    }
-
-    // ---- camera permission + open ------------------------------------
-
-    private void ensureCameraPermissionThenOpen() {
-        if (checkSelfPermission(Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED) {
-            openCamera();
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startCamera();
         } else {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA_PERM);
         }
     }
 
+    // ---- models + camera ----------------------------------------------
+
+    // [A]
+    private void loadModels() {
+        try {
+            long t0 = SystemClock.elapsedRealtime();
+            detector = new DogDetector(this);
+            classifier = new PostureClassifier(this);
+            pipeline = new VisionPipeline(detector, classifier);
+            resetReadinessOnAnalysis();
+            modelsReady = true;
+            long ms = SystemClock.elapsedRealtime() - t0;
+            runOnUiThread(() -> {
+                // A permanently denied permission is answered almost at
+                // once, often before the models finish loading: keep the
+                // denial on screen, or the user is told to point a camera
+                // that will never start.
+                if (cameraDenied && !replayMode) {
+                    tvSeqStatus.setText(String.format(Locale.US, "%s (On-device models loaded in %d ms.)",
+                            CAMERA_DENIED_MSG, ms));
+                } else {
+                    tvSeqStatus.setText(String.format(Locale.US,
+                            "On-device models loaded in %d ms. %s", ms,
+                            replayMode ? "Replaying frames." : "Point the camera at the dog."));
+                }
+                updateStartButton();
+            });
+        } catch (Throwable e) {
+            runOnUiThread(() -> tvSeqStatus.setText(
+                    "Could not load the on-device models: " + e.getMessage()));
+        }
+    }
+
     @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                                           int[] grantResults) {
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_CAMERA_PERM) {
-            if (grantResults.length > 0
-                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                if (texturePreview.isAvailable()) openCamera();
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                cameraDenied = false;
+                if (!cameraStarted) startCamera();
             } else {
-                tvSeqStatus.setText("Camera permission denied - sequence mode "
-                        + "needs the camera to watch the dog.");
+                cameraDenied = true;
+                tvSeqStatus.setText(CAMERA_DENIED_MSG);
             }
         }
     }
 
-    @SuppressLint("MissingPermission") // checked in ensureCameraPermissionThenOpen
-    private void openCamera() {
-        if (cameraDevice != null || !texturePreview.isAvailable()) return;
-        try {
-            CameraManager manager = (CameraManager) getSystemService(CAMERA_SERVICE);
-            if (manager == null) return;
+    private static final String CAMERA_DENIED_MSG = "Camera permission denied. The assistant needs the "
+            + "camera to watch the dog - allow it in Settings > Apps.";
 
-            // Prefer the back camera; fall back to any camera.
-            String cameraId = null;
-            CameraCharacteristics chosen = null;
-            for (String id : manager.getCameraIdList()) {
-                CameraCharacteristics cc = manager.getCameraCharacteristics(id);
-                Integer facing = cc.get(CameraCharacteristics.LENS_FACING);
-                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
-                    cameraId = id;
-                    chosen = cc;
-                    break;
-                }
-                if (cameraId == null) {
-                    cameraId = id;
-                    chosen = cc;
-                }
+    private void startCamera() {
+        cameraStarted = true;
+        ListenableFuture<ProcessCameraProvider> f = ProcessCameraProvider.getInstance(this);
+        f.addListener(() -> {
+            try {
+                ProcessCameraProvider provider = f.get();
+                ResolutionSelector rs = new ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .setResolutionStrategy(new ResolutionStrategy(new Size(640, 480),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                        .build();
+                Preview preview = new Preview.Builder()
+                        .setResolutionSelector(new ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                                .build())
+                        .build();
+                preview.setSurfaceProvider(previewView.getSurfaceProvider());
+                ImageAnalysis analysis = new ImageAnalysis.Builder()
+                        .setResolutionSelector(rs)
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                        .build();
+                analysis.setAnalyzer(analysisExecutor, this::analyze);
+                CameraSelector selector = provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)
+                        ? CameraSelector.DEFAULT_BACK_CAMERA : CameraSelector.DEFAULT_FRONT_CAMERA;
+                // PreviewView mirrors a front camera's preview but the
+                // analysis frames are not mirrored; the overlay flips the
+                // box to match (setDisplayTransform in handleFrame). The
+                // world rotation also runs the other way for a front lens.
+                frontLens = selector == CameraSelector.DEFAULT_FRONT_CAMERA;
+                provider.unbindAll();
+                provider.bindToLifecycle(this, selector, preview, analysis);
+            } catch (Exception e) {
+                cameraStarted = false; // let the next onResume try again
+                tvSeqStatus.setText("Could not start the camera: " + e.getMessage());
             }
-            if (cameraId == null || chosen == null) {
-                tvSeqStatus.setText("No camera found on this device.");
-                return;
-            }
-
-            StreamConfigurationMap map = chosen.get(
-                    CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            if (map == null) return;
-            Size previewSize = chooseSize(map.getOutputSizes(SurfaceTexture.class), 1280, 720);
-            Size jpegSize = chooseSize(map.getOutputSizes(ImageFormat.JPEG), 1280, 1280);
-
-            SurfaceTexture st = texturePreview.getSurfaceTexture();
-            st.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
-            previewSurface = new Surface(st);
-
-            // The ImageReader gives us the actual frame bytes (JPEG) that
-            // the sampler sends to the backend. We only keep the newest.
-            imageReader = ImageReader.newInstance(
-                    jpegSize.getWidth(), jpegSize.getHeight(), ImageFormat.JPEG, 2);
-            imageReader.setOnImageAvailableListener(reader -> {
-                Image img = reader.acquireLatestImage();
-                if (img == null) return;
-                try {
-                    ByteBuffer buf = img.getPlanes()[0].getBuffer();
-                    byte[] bytes = new byte[buf.remaining()];
-                    buf.get(bytes);
-                    latestJpeg = bytes;
-                } finally {
-                    img.close();
-                }
-            }, cameraHandler);
-
-            manager.openCamera(cameraId, new CameraDevice.StateCallback() {
-                @Override
-                public void onOpened(CameraDevice device) {
-                    cameraDevice = device;
-                    startPreviewSession();
-                }
-
-                @Override
-                public void onDisconnected(CameraDevice device) {
-                    device.close();
-                    cameraDevice = null;
-                }
-
-                @Override
-                public void onError(CameraDevice device, int error) {
-                    device.close();
-                    cameraDevice = null;
-                    runOnUiThread(() -> tvSeqStatus.setText(
-                            "Camera error " + error + " - preview unavailable."));
-                }
-            }, cameraHandler);
-        } catch (Exception e) {
-            tvSeqStatus.setText("Could not open camera: " + e.getMessage());
-        }
+        }, androidx.core.content.ContextCompat.getMainExecutor(this));
     }
 
-    private void startPreviewSession() {
-        if (cameraDevice == null) return;
-        try {
-            List<Surface> surfaces = Arrays.asList(previewSurface, imageReader.getSurface());
-            cameraDevice.createCaptureSession(surfaces,
-                    new CameraCaptureSession.StateCallback() {
-                        @Override
-                        public void onConfigured(CameraCaptureSession session) {
-                            captureSession = session;
-                            try {
-                                CaptureRequest.Builder b = cameraDevice.createCaptureRequest(
-                                        CameraDevice.TEMPLATE_PREVIEW);
-                                b.addTarget(previewSurface);
-                                b.addTarget(imageReader.getSurface());
-                                session.setRepeatingRequest(b.build(), null, cameraHandler);
-                                runOnUiThread(() -> tvSeqStatus.setText(
-                                        "Camera live. Pick a command and tap START SEQUENCE."));
-                            } catch (CameraAccessException e) {
-                                runOnUiThread(() -> tvSeqStatus.setText(
-                                        "Preview failed: " + e.getMessage()));
-                            }
+    // ---- replay (debug) ----------------------------------------------------
+
+    private final java.util.concurrent.ScheduledExecutorService replayTimer =
+            Executors.newSingleThreadScheduledExecutor();
+
+    // fps = playback speed (frames per wall-clock second); clipFps = the
+    // rate the frames were extracted from the video at. They are kept
+    // apart because the state machine's rules (3 s response window, 0.6 s
+    // hold, 1.5 s lost rule, READY timers) must run on CLIP time: replaying
+    // a 5 fps clip at 2 fps would otherwise stretch every second of the
+    // video to 2.5 s and turn a 2 s sit into "not reached within 3 s".
+    private void startReplay(String name, float fps, float clipFps, boolean autostart) {
+        // Internal storage first (adb: push to /data/local/tmp, then
+        // `run-as com.cs663.dogbackend cp -r ... files/replay/`), then the
+        // external files dir.
+        java.io.File dir = new java.io.File(new java.io.File(getFilesDir(), "replay"), name);
+        if (!dir.isDirectory()) {
+            dir = new java.io.File(new java.io.File(getExternalFilesDir(null), "replay"), name);
+        }
+        java.io.File[] files = dir.listFiles((d, n) -> n.toLowerCase(Locale.US).endsWith(".jpg")
+                || n.toLowerCase(Locale.US).endsWith(".png"));
+        if (files == null || files.length == 0) {
+            tvSeqStatus.setText("Replay: no frames in " + dir);
+            return;
+        }
+        Arrays.sort(files);
+        replayMode = true;
+        final double clipRate = clipFps > 0 ? clipFps : 2.0;
+        tvSeqStatus.setText(String.format(Locale.US, "Replay mode: %d frames from %s (clip %.1f fps)",
+                files.length, name, clipRate));
+        final int[] idx = {0};
+        final boolean[] started = {false};
+        // Any large base works (only differences are used); starting at
+        // "now" keeps the escalation timer (lastEscalationMs = 0) from
+        // treating the first seconds of the clip specially.
+        final long replayBaseMs = SystemClock.elapsedRealtime();
+        replayClockMs = replayBaseMs;
+        long period = Math.max(50, Math.round(1000 / (fps > 0 ? fps : 2f)));
+        // Fixed DELAY, and the timer waits for each frame to finish on the
+        // analysis thread, so a slow device never builds a backlog (a
+        // backlog would push START behind the whole clip).
+        replayTimer.scheduleWithFixedDelay(() -> {
+            try {
+                analysisExecutor.submit(() -> {
+                    if (!modelsReady) return;
+                    if (idx[0] >= files.length) {
+                        if (!replayDone) {
+                            replayDone = true;
+                            if (session != null && !session.isDecided()) onVerdict(session.finish());
+                            runOnUiThread(() -> tvFps.setText("replay finished"));
                         }
-
-                        @Override
-                        public void onConfigureFailed(CameraCaptureSession session) {
-                            runOnUiThread(() -> tvSeqStatus.setText(
-                                    "Camera session failed to configure."));
-                        }
-                    }, cameraHandler);
-        } catch (CameraAccessException e) {
-            tvSeqStatus.setText("Preview failed: " + e.getMessage());
-        }
-    }
-
-    // Largest size that fits the caps, or the smallest available.
-    private Size chooseSize(Size[] choices, int maxW, int maxH) {
-        Size best = null;
-        for (Size s : choices) {
-            if (s.getWidth() <= maxW && s.getHeight() <= maxH
-                    && (best == null || s.getWidth() * s.getHeight()
-                    > best.getWidth() * best.getHeight())) {
-                best = s;
+                        return;
+                    }
+                    final int frameIdx = idx[0]++;
+                    Bitmap b = android.graphics.BitmapFactory.decodeFile(files[frameIdx].getPath());
+                    if (b == null) return;
+                    // Clip time for this frame. Every time-based rule reads
+                    // r.elapsedMs or nowMs(), so all of them follow it -
+                    // including VisionPipeline's box hold, which is why the
+                    // clock is passed in rather than overwritten afterwards.
+                    replayClockMs = replayBaseMs + Math.round(frameIdx * 1000.0 / clipRate);
+                    VisionPipeline.FrameResult r = pipeline.process(b, replayClockMs);
+                    final Bitmap shownFrame = b;
+                    runOnUiThread(() -> overlay.setFrame(shownFrame));
+                    handleFrame(r);
+                    if (autostart && !started[0] && gateOpen) {
+                        started[0] = true;
+                        runOnUiThread(() -> startSequence(false));
+                    }
+                }).get();
+            } catch (Exception ignored) {
             }
-        }
-        if (best != null) return best;
-        Size smallest = choices[0];
-        for (Size s : choices) {
-            if (s.getWidth() * s.getHeight() < smallest.getWidth() * smallest.getHeight()) {
-                smallest = s;
+            if (replayDone) replayTimer.shutdown();
+        }, 500, period, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    // [A] One camera frame. CameraX hands frames in sensor orientation;
+    // they are rotated upright here, because Models C, A and B were all
+    // trained on upright photos.
+    //
+    // Two rotations, combined into one bitmap copy:
+    //  1. getRotationDegrees(): sensor -> SCREEN-upright. For this
+    //     portrait-locked activity that is only right while the phone is
+    //     physically upright.
+    //  2. extra (worldRotationDeg): SCREEN-upright -> WORLD-upright, from
+    //     the OrientationEventListener. Its convention: 90 means the
+    //     phone is turned 90 deg CLOCKWISE (its left edge is now on top).
+    //     The back camera turns with the phone, so world-up is now the
+    //     frame's LEFT edge - the scene is turned 90 deg counter-clockwise
+    //     in the frame - and we rotate the frame back 90 deg CLOCKWISE
+    //     (Matrix.postRotate(+90) with y down is clockwise) to bring the
+    //     left edge to the top. So extra = device rotation for the back
+    //     lens. A front lens looks the other way, so left and right swap
+    //     in its (unmirrored) frame and the same phone turn needs the
+    //     opposite correction: extra = 360 - device rotation. (This is the
+    //     same as CameraX's rule: back = sensor - target rotation, front =
+    //     sensor + target rotation.)
+    // Rotations compose additively, so one postRotate(rot + extra) does
+    // both. The overlay is told `extra` (OverlayView.setDisplayTransform) to
+    // map the box back onto the portrait preview.
+    private void analyze(ImageProxy img) {
+        try {
+            if (!modelsReady) return;
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastAnalysedMs < MIN_FRAME_INTERVAL_MS) return;
+            lastAnalysedMs = now;
+
+            // Latched for a running attempt: changing it mid-attempt
+            // would flip the frame's aspect ratio and box coordinates and
+            // mix two different views in the temporal state machine.
+            boolean attemptRunning = session != null && !session.isDecided();
+            int extra = attemptRunning ? runExtraRotDeg : worldRotationDeg();
+            if (extra != appliedExtraRotDeg) {
+                appliedExtraRotDeg = extra;
+                // The tracked box is in the old frame's coordinates, and
+                // the READY decision was made on the old view.
+                pipeline.resetTracking();
+                resetReadinessOnAnalysis();
             }
-        }
-        return smallest;
-    }
 
-    private void closeCamera() {
-        if (captureSession != null) {
-            captureSession.close();
-            captureSession = null;
-        }
-        if (cameraDevice != null) {
-            cameraDevice.close();
-            cameraDevice = null;
-        }
-        if (imageReader != null) {
-            imageReader.close();
-            imageReader = null;
-        }
-        if (previewSurface != null) {
-            previewSurface.release();
-            previewSurface = null;
+            Bitmap frame = img.toBitmap();
+            int rot = (img.getImageInfo().getRotationDegrees() + extra) % 360;
+            if (rot != 0) {
+                Matrix m = new Matrix();
+                m.postRotate(rot);
+                Bitmap r = Bitmap.createBitmap(frame, 0, 0, frame.getWidth(), frame.getHeight(), m, true);
+                frame.recycle();
+                frame = r;
+            }
+            VisionPipeline.FrameResult r = pipeline.process(frame);
+            handleFrame(r);
+        } catch (Throwable e) {
+            runOnUiThread(() -> tvSeqStatus.setText("Frame error: " + e.getMessage()));
+        } finally {
+            img.close();
         }
     }
 
-    // ---- the sequence run ---------------------------------------------
-
-    // Command -> target posture. Stay holds whatever posture the trainer
-    // picked in the Stay posture spinner (a "stay" is a hold of a
-    // posture, not a posture of its own).
-    private String targetFor(String command, String stayPosture) {
-        switch (command) {
-            case "Sit":
-                return "sitting";
-            case "Down":
-                return "lying_down";
-            case "Stand":
-                return "standing";
-            case "Walk":
-                return "walking";
-            case "Stay":
-                return SequenceSession.canonicalLabel(stayPosture);
-            default:
-                return "sitting";
+    // [A]
+    private void handleFrame(VisionPipeline.FrameResult r) {
+        // Only a box Model C actually found this frame is judged. A "held"
+        // box (detector missed, last box reused) has no crop/Model A
+        // result (see VisionPipeline), and is fed to the state machine as an
+        // unclear, dog-not-seen frame: the session's lost rule absorbs
+        // short detector gaps, and a stale box never decides a verdict.
+        final boolean detected = "detected".equals(r.boxSource);
+        String fed = null;
+        Double conf = null;
+        if (detected && r.judged != null) {   // whole-frame Model A, see FrameResult.judged
+            fed = r.judged.label;
+            conf = (double) r.judged.confidence;
         }
-    }
+        boolean confident = conf != null && conf >= MIN_CONF;
 
-    // Command -> required STARTING posture for the READY gate
-    // (proposal 5.2: Sit starts from Stand, Down starts from Sit, Stay
-    // starts from the selected posture). Stand is not in the proposal's
-    // MVP table; it is a hold of the standing posture, so its starting
-    // posture is standing, like Stay (Standing). Walk has no starting
-    // posture requirement (null) - it is outside the proposal's MVP
-    // table and is kept as an extra command.
-    private String requiredStartingLabel(String command, String stayPosture) {
-        switch (command) {
-            case "Sit":
-                return "standing";
-            case "Down":
-                return "sitting";
-            case "Stand":
-                return "standing";
-            case "Stay":
-                return SequenceSession.canonicalLabel(stayPosture);
-            case "Walk":
-                return null;
-            default:
-                return "standing";
+        // fps over a 2 s window
+        if (fpsWindowStart == 0) fpsWindowStart = r.elapsedMs;
+        fpsFrames++;
+        double fps = -1;
+        if (r.elapsedMs - fpsWindowStart >= 2000) {
+            fps = fpsFrames * 1000.0 / (r.elapsedMs - fpsWindowStart);
+            fpsFrames = 0;
+            fpsWindowStart = r.elapsedMs;
         }
-    }
 
-    private boolean isReachThenHoldCommand(String command) {
-        return "Sit".equals(command) || "Down".equals(command);
-    }
+        if (session != null && !session.isDecided()) {
+            double t = Math.max(0, (r.elapsedMs - runT0Ms) / 1000.0);
+            SequenceSession.Verdict v = session.feed(t, fed, conf, detected);
+            frameLatencies.add(r.totalMs);
+            // Key frames for Model B only from detected boxes, so Model B
+            // never re-checks a crop of a stale box.
+            if (detected && r.cropBitmap != null) {
+                if (keyframes.size() >= MAX_KEYFRAMES) keyframes.remove(0);
+                KeyFrame kf = new KeyFrame();
+                kf.t = t;
+                kf.label = confident ? fed : null;
+                kf.conf = conf == null ? 0f : conf.floatValue();
+                kf.jpeg = smallJpeg(r.cropBitmap);
+                keyframes.add(kf);
+            }
+            if (log != null) log.frame(t, session.getPhase(), r, confident ? fed : null, session.getLastSmoothed());
+            if (!reachedCued && session.getReachedAt() != null && v == null) {
+                reachedCued = true;
+                cues.reached();
+            }
+            final SequenceSession s = session;
+            runOnUiThread(() -> updateLiveUi(s));
+            if (v != null) onVerdict(v);
+        } else {
+            readinessStep(r, fed, conf, detected);
+        }
 
-    private void updateDurationEnabled() {
-        String cmd = COMMANDS[spCommand.getSelectedItemPosition()];
-        // Sit/Down use the fixed 3s response window + 0.6s hold; the
-        // duration spinner does not apply to them.
-        spDuration.setEnabled(!isReachThenHoldCommand(cmd));
+        final double fpsShow = fps;
+        final String chip = !r.dogPresent ? "No dog"
+                : r.judged == null ? "Dog not detected this frame (holding last box)"
+                : (confident ? pretty(fed) : "Unsure (" + pretty(r.judged.label) + "?)");
+        // Replay frames are never rotated and never mirrored, and the
+        // overlay draws them itself.
+        final int dispRot = replayMode ? 0 : appliedExtraRotDeg;
+        final boolean mirror = !replayMode && frontLens;
+        runOnUiThread(() -> {
+            overlay.setDisplayTransform(dispRot, mirror);
+            overlay.show(r, confident);
+            tvSeqCurrent.setText("Posture: " + chip);
+            if (fpsShow > 0) {
+                tvFps.setText(String.format(Locale.US, "%.1f fps · C %d ms · A %d ms",
+                        fpsShow, r.detMs, r.clsMs));
+            }
+        });
     }
 
     // ---- READY gate ----------------------------------------------------
-    // The readiness sampler runs while the screen is open and no
-    // sequence is running. Same 1 fps classification as a run, through
-    // the same majority-vote smoother - but nothing is judged; the only
-    // output is whether START may be tapped. At 1 fps, the proposal's
-    // "starting posture stable >=0.6s" maps to 1 confirmed (smoothed)
-    // frame of the required posture. The gate is a UI enablement, not
-    // a verdict: the session still judges the attempt from t=0, so a
-    // single noisy frame opening the gate cannot fake a result.
-    private void startReadiness() {
-        if (readyRunning || running || paused) return;
-        readyRequiredLabel = requiredStartingLabel(
-                COMMANDS[spCommand.getSelectedItemPosition()],
-                STAY_POSTURES[spStayPosture.getSelectedItemPosition()]);
-        readinessSmoother = new SequenceSession.TemporalSmoother(3, 0.6);
-        readyGateOpen = false;
-        readyFrameSeen = false;
-        readyLastSmoothed = null;
-        readyRunning = true;
-        updateStartButton();
-        readyFuture = sampler.scheduleWithFixedDelay(
-                this::readySampleOnce, 0, 1, TimeUnit.SECONDS);
+
+    private void requestReadinessReset() {
+        analysisExecutor.execute(this::resetReadinessOnAnalysis);
     }
 
-    private void stopReadiness() {
-        readyRunning = false;
-        if (readyFuture != null) readyFuture.cancel(false);
-        readyFuture = null;
+    // [A]
+    private void resetReadinessOnAnalysis() {
+        readyRequired = requiredStartingLabel(COMMANDS[selCommand], STAY_LABELS[selStay]);
+        readinessSmoother = new SequenceSession.TemporalSmoother(5, MIN_CONF);
+        readyLastSmoothed = SequenceSession.UNCERTAIN_FRAME;
+        readySinceMs = null;
+        readyDetectedFrames = 0;
+        readyStable = false;
+        unsureSinceMs = null;
+        gateOpen = false;
+        readyGen.incrementAndGet();
+        bReadyLabel = null;
+        uiGateOpen = false;
+        runOnUiThread(this::updateStartButton);
     }
 
-    private void resetReadiness() {
-        stopReadiness();
-        updateStartButton();
-        startReadiness();
-    }
-
-    private void updateStartButton() {
-        btnStartSeq.setEnabled(readyGateOpen && !running);
-    }
-
-    private void readySampleOnce() {
-        if (!readyRunning || running || paused) return;
-        byte[] jpeg = latestJpeg;
-        if (jpeg == null) {
-            runOnUiThread(() -> {
-                tvSeqCurrent.setText("Current posture: -");
-                tvSeqStatus.setText("Waiting for the first camera frame...");
-            });
-            return;
-        }
-        String base = etSeqUrl.getText().toString().trim();
-        if (base.isEmpty() || base.contains("YOUR-CLOUD-RUN-URL")) {
-            runOnUiThread(() -> {
-                readyGateOpen = false;
-                updateStartButton();
-                tvSeqStatus.setText("Set the real backend URL first.");
-            });
-            return;
-        }
-        if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
-
-        String label = null;
-        Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
-        if (bmp != null) {
-            String b64 = Base64.encodeToString(toJpeg640(bmp), Base64.NO_WRAP);
-            String text = postModel(base + "/api/fine-tuned-gemini",
-                    FRAME_PROMPT, b64);
-            if (text != null) label = parseLabel(text);
-        }
-
-        String smoothed = readinessSmoother.push(label, null, label != null);
-        readyLastSmoothed = smoothed;
-        readyFrameSeen = true;
-        // Gate: the required starting posture is the current smoothed
-        // label (Walk: no requirement, any classified frame will do).
-        readyGateOpen = readyRequiredLabel == null
-                || smoothed.equals(readyRequiredLabel);
-        final String showSmoothed = smoothed;
-        runOnUiThread(() -> {
-            tvSeqCurrent.setText("Current posture: " + pretty(showSmoothed));
-            if (readyGateOpen) {
-                tvSeqStatus.setText(readyRequiredLabel == null
-                        ? "Ready - Walk has no starting posture. Tap START SEQUENCE."
-                        : "Ready: the dog is " + pretty(readyRequiredLabel)
-                                + ". Tap START SEQUENCE.");
-            } else {
-                tvSeqStatus.setText("Waiting for starting posture: "
-                        + pretty(readyRequiredLabel) + "...");
-            }
-            updateStartButton();
-        });
-    }
-
-    private void startSequence() {
-        String base = etSeqUrl.getText().toString().trim();
-        if (base.isEmpty() || base.contains("YOUR-CLOUD-RUN-URL")) {
-            tvSeqStatus.setText("Set the real backend URL first.");
-            return;
-        }
-        if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
-        backendBase = base;
-
-        runCommand = COMMANDS[spCommand.getSelectedItemPosition()];
-        runTargetLabel = targetFor(runCommand,
-                STAY_POSTURES[spStayPosture.getSelectedItemPosition()]);
-        runDurationSec = DURATION_SECONDS[spDuration.getSelectedItemPosition()];
-
-        // The READY gate has done its job; t=0 is now.
-        stopReadiness();
-        readyGateOpen = false;
-
-        // State machine config: window 3, grace 2, break confirm 1,
-        // lost after 2 unclear frames, uncertain ratio 0.4 - at 1 fps
-        // these numbers are frames = seconds (see SequenceSession's
-        // header comment). Sit/Down run as RESPONSE then HOLD
-        // (proposal 5.2): reach the target within 3s, then hold 0.6s.
-        SequenceSession.Config cfg =
-                new SequenceSession.Config(runDurationSec);
-        cfg.reachThenHold = isReachThenHoldCommand(runCommand);
-        session = new SequenceSession(runTargetLabel, cfg, runCommand);
-        sampleIndex = 0;
-        lastFrameB64 = null;
-        lastVerdict = null;
-        running = true;
-
-        layoutVerdict.setVisibility(View.GONE);
-        tvSeqCurrent.setText("Current posture: -");
-        progressSeq.setMax(runDurationSec);
-        progressSeq.setProgress(0);
-        tvSeqProgress.setText("Running... waiting for frames.");
-        if (cfg.reachThenHold) {
-            tvSeqStatus.setText("Sequence running: command " + runCommand
-                    + " - reach '" + pretty(runTargetLabel) + "' within 3s, "
-                    + "then hold it for 0.6s. One frame per second is judged.");
-        } else {
-            tvSeqStatus.setText("Sequence running: command " + runCommand
-                    + ", target '" + pretty(runTargetLabel) + "' for "
-                    + runDurationSec + "s. One frame per second is judged.");
-        }
-        setControlsRunning(true);
-
-        // Fixed-delay so a slow network call never overlaps the next
-        // sample; a timed-out call just makes that frame a no-label one.
-        sampleFuture = sampler.scheduleWithFixedDelay(
-                this::sampleOnce, 0, 1, TimeUnit.SECONDS);
-    }
-
-    // One sampler tick: classify the newest frame and feed the machine.
-    // Runs on the sampler thread; each fed frame advances the sequence
-    // clock by 1 (t = sample index), so the state machine's seconds are
-    // frames - the timeline in SequenceSession's comments.
-    private void sampleOnce() {
-        if (!running || session == null) return;
-        byte[] jpeg = latestJpeg;
-        if (jpeg == null) {
-            runOnUiThread(() -> tvSeqStatus.setText(
-                    "Sequence running... waiting for the first camera frame."));
-            return;
-        }
-
-        String label = null;
-        Bitmap bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length);
-        if (bmp != null) {
-            String b64 = Base64.encodeToString(toJpeg640(bmp), Base64.NO_WRAP);
-            lastFrameB64 = b64;
-            String text = postModel(backendBase + "/api/fine-tuned-gemini",
-                    FRAME_PROMPT, b64);
-            if (text != null) label = parseLabel(text);
-        }
-
-        double t = sampleIndex++;
-        SequenceSession.Verdict v = session.feed(t, label);
-        runOnUiThread(() -> updateLiveUi());
-        if (v != null) onVerdict(v);
-    }
-
-    private void updateLiveUi() {
-        if (session == null) return;
-        String cur = session.getLastSmoothed();
-        tvSeqCurrent.setText("Current posture: "
-                + (cur == null ? "-" : pretty(cur)));
-        double held = 0;
-        if (session.getReachedAt() != null && session.getLastT() != null) {
-            held = Math.max(0, session.getLastT() - session.getReachedAt());
-        }
-        if (session.isReachThenHold()) {
-            // Sit/Down: the progress line is the response window /
-            // confirmation hold, not the duration spinner.
-            progressSeq.setMax(3);
-            progressSeq.setProgress((int) Math.min(3,
-                    session.getLastT() == null ? 0 : session.getLastT()));
-            if ("RESPONSE".equals(session.getPhase())) {
-                tvSeqProgress.setText(String.format(Locale.US,
-                        "Frames sampled: %d (t = %.0fs) - waiting for the dog "
-                                + "to reach '%s' (3s window)",
-                        session.getFrameCount(),
-                        session.getLastT() == null ? 0 : session.getLastT(),
-                        pretty(session.getTargetLabel())));
-            } else {
-                tvSeqProgress.setText(String.format(Locale.US,
-                        "Frames sampled: %d (t = %.0fs) - target reached, "
-                                + "confirming the 0.6s hold",
-                        session.getFrameCount(),
-                        session.getLastT() == null ? 0 : session.getLastT()));
-            }
-            return;
-        }
-        progressSeq.setProgress((int) Math.min(runDurationSec, held));
-        tvSeqProgress.setText(String.format(Locale.US,
-                "Frames sampled: %d (t = %.0fs) - held %.0fs / %ds",
-                session.getFrameCount(),
-                session.getLastT() == null ? 0 : session.getLastT(),
-                held, runDurationSec));
-    }
-
-    // STOP tapped (fromUser) or the screen is going away: finish() gives
-    // the verdict for an interval that ended undecided.
-    private void stopSequence(boolean fromUser) {
-        if (!running || session == null) return;
-        running = false;
-        if (sampleFuture != null) sampleFuture.cancel(false);
-        onVerdict(session.finish());
-    }
-
-    private void onVerdict(SequenceSession.Verdict v) {
-        running = false;
-        if (sampleFuture != null) sampleFuture.cancel(false);
-        lastVerdict = v;
-        runOnUiThread(() -> {
-            setControlsRunning(false);
-            updateLiveUi();
-            layoutVerdict.setVisibility(View.VISIBLE);
-            tvSeqVerdict.setText("Verdict: " + v.verdict);
-            tvSeqStatus.setText("Sequence finished: " + v.verdict);
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("Command: ").append(runCommand);
-            if (isReachThenHoldCommand(runCommand)) {
-                // Sit/Down rule (proposal 5.2): reach within 3s, hold
-                // 0.6s - the duration spinner does not apply here.
-                sb.append(" - rule: reach '").append(pretty(v.targetLabel))
-                        .append("' within 3s, then hold 0.6s\n");
-            } else {
-                sb.append(" - target '").append(pretty(v.targetLabel))
-                        .append("' for ")
-                        .append(String.format(Locale.US, "%.0f", v.targetDurationS))
-                        .append("s\n");
-            }
-            sb.append("Held: ").append(String.format(Locale.US, "%.1f", v.heldS)).append("s");
-            if (v.breakAtS != null) {
-                // Break time is when the dog FIRST left the posture
-                // (proposal 5.3), not when the break was confirmed.
-                sb.append(" - broke at ").append(String.format(Locale.US, "%.1f", v.breakAtS))
-                        .append("s (first wrong posture)");
-            }
-            sb.append("\nFrames judged: ").append(v.nFrames)
-                    .append(" - unclear frames: ")
-                    .append(String.format(Locale.US, "%.0f", v.uncertainRatio * 100))
-                    .append("%\n");
-            sb.append("Reason: ").append(v.reason).append("\n");
-            sb.append("Smoothed label sequence (1 per second):\n");
-            List<String> prettySeq = new ArrayList<>();
-            for (String step : v.smoothedSequence) {
-                // stored as "t label"
-                int sp = step.indexOf(' ');
-                prettySeq.add(pretty(step.substring(sp + 1)));
-            }
-            sb.append(String.join(", ", prettySeq));
-            tvSeqDetails.setText(sb.toString());
-            tvSeqFeedback.setText("(getting trainer feedback...)");
-        });
-        // Model B at runtime: auto-run the feedback request; the button
-        // stays available to re-run it.
-        fetchFeedback(v);
-        // Back to the READY gate so the trainer can run again once the
-        // dog is back in the required starting posture.
-        startReadiness();
-    }
-
-    private void setControlsRunning(boolean isRunning) {
-        // The Start button is owned by the READY gate, never enabled
-        // directly here - after a run it stays disabled until the gate
-        // re-opens (startReadiness, above).
-        if (isRunning) {
-            btnStartSeq.setEnabled(false);
-        } else {
-            updateStartButton();
-        }
-        btnStopSeq.setEnabled(isRunning);
-        spCommand.setEnabled(!isRunning);
-        spStayPosture.setEnabled(!isRunning);
-        // Sit/Down never use the duration spinner (fixed 3s + 0.6s rule).
-        spDuration.setEnabled(!isRunning
-                && !(runCommand != null && isReachThenHoldCommand(runCommand)));
-        etSeqUrl.setEnabled(!isRunning);
-    }
-
-    // ---- Model B feedback (proposal 7) --------------------------------
-    // The deployed backend requires imageBase64 on EVERY call (there is
-    // no text-only endpoint), so the last captured frame rides along
-    // with the feedback prompt. The prompt itself carries ONLY the
-    // evidence: command, target duration, and the timestamped smoothed
-    // posture timeline. It deliberately does NOT carry the engine's
-    // verdict and does NOT carry the break time, so Model B judges the
-    // evidence independently instead of copying the local decision.
-    // The reply contract is a JSON object with exactly: status
-    // (success / early_break / uncertain), break_time_s (number or
-    // null), evidence_summary, coaching_tip, and optional caution.
-    //
-    // Authority rule (proposal 7): the on-device temporal engine is
-    // the authority for status and timing. resolveFeedback() compares
-    // the model's status with the LOCAL verdict: if they agree, the
-    // model's summary and tip are shown; if they disagree, or the
-    // reply cannot be parsed, or the call fails, the LOCAL verdict is
-    // shown with a deterministic template tip. The model's verdict is
-    // NEVER displayed when it disagrees with the local one.
-    private void fetchFeedback(SequenceSession.Verdict v) {
-        String b64 = lastFrameB64;
-        if (b64 == null) {
-            runOnUiThread(() -> tvSeqFeedback.setText(
-                    "No frame was captured, so no feedback call was made."));
-            return;
-        }
-        List<String> timeline = new ArrayList<>();
-        for (String step : v.smoothedSequence) {
-            int sp = step.indexOf(' ');
-            timeline.add(step.substring(0, sp) + "s: "
-                    + pretty(step.substring(sp + 1)));
-        }
-        String prompt = "You are an expert dog training assistant. "
-                + "Review this training attempt and reply with a JSON "
-                + "object only, no other text.\n"
-                + "Command: " + runCommand
-                + ". Target duration: " + runDurationSec + " seconds.\n"
-                + "Timestamped smoothed posture timeline "
-                + "(one label per second): "
-                + String.join(", ", timeline) + ".\n"
-                + "Reply with a JSON object with exactly these fields: "
-                + "\"status\" (one of: success, early_break, uncertain), "
-                + "\"break_time_s\" (a number, or null), "
-                + "\"evidence_summary\" (one sentence), "
-                + "\"coaching_tip\" (one short sentence), "
-                + "\"caution\" (optional, one short sentence).";
-        String url = backendBase;
-        new Thread(() -> {
-            String text = postModel(url + "/api/gemini", prompt, b64);
-            runOnUiThread(() -> tvSeqFeedback.setText(
-                    resolveFeedback(v, text)));
-        }).start();
-    }
-
-    // Parse the model's JSON reply (tolerating a ```json code fence),
-    // compare its status with the local verdict, and decide what to
-    // show. See the authority rule in the comment above fetchFeedback.
-    private String resolveFeedback(SequenceSession.Verdict v, String text) {
-        String modelStatus = null;
-        String summary = null;
-        String tip = null;
-        String caution = null;
-        if (text != null) {
-            try {
-                String s = text.trim();
-                if (s.startsWith("```")) {
-                    int nl = s.indexOf('\n');
-                    if (nl >= 0) s = s.substring(nl + 1);
-                    int end = s.lastIndexOf("```");
-                    if (end > 0) s = s.substring(0, end);
-                    s = s.trim();
+    // [A] Gate opens when the required starting posture has been the
+    // smoothed Model A label for 0.6 s - or, when Model A stays unsure,
+    // when Model B (fine-tuned Gemini) confirms it on a crop.
+    private void readinessStep(VisionPipeline.FrameResult r, String fed, Double conf, boolean detected) {
+        if (readinessSmoother == null || session != null && !session.isDecided()) return;
+        long now = r.elapsedMs;
+        // A held frame (detector missed, last box reused for <= 1 s) has no
+        // Model A label (see VisionPipeline). It is not pushed into the smoother:
+        // the smoother returns "unclear" for a not-detected frame, which
+        // would reset readySinceMs and drop the gate on every single
+        // detector miss - and re-fire the READY cue each time it reopens.
+        // Instead a held frame carries the last detected frame's vote
+        // forward, so it neither adds evidence nor wipes it. Once the hold
+        // expires the frame is "none" (dogPresent=false) and resets as usual.
+        boolean held = r.dogPresent && !detected;
+        String smoothed = held ? readyLastSmoothed : readinessSmoother.push(fed, conf, detected);
+        if (!held) readyLastSmoothed = smoothed;
+        boolean aMatch = r.dogPresent && (readyRequired == null
+                ? !smoothed.equals(SequenceSession.UNCERTAIN_FRAME)
+                : smoothed.equals(readyRequired));
+        // A held frame carries no new evidence, so it may keep a running
+        // stable span alive but must never START it or COMPLETE it:
+        // otherwise one detected frame followed by ~0.6 s of held frames
+        // would open READY. Start/complete are judged on detected frames
+        // only, and the span needs >= 3 detected frames. Once a detected
+        // frame has completed it, held frames keep it (no gate flicker).
+        if (aMatch) {
+            if (!held) {
+                if (readySinceMs == null) {
+                    readySinceMs = now;
+                    readyDetectedFrames = 0;
                 }
-                JSONObject j = new JSONObject(s);
-                String rawStatus = j.optString("status", "")
-                        .trim().toLowerCase(Locale.US);
-                if (rawStatus.equals("success")) modelStatus = "SUCCESS";
-                else if (rawStatus.equals("early_break")) modelStatus = "EARLY_BREAK";
-                else if (rawStatus.equals("uncertain")) modelStatus = "UNCERTAIN";
-                summary = j.optString("evidence_summary", null);
-                tip = j.optString("coaching_tip", null);
-                caution = j.optString("caution", null);
-                if (summary != null && summary.isEmpty()) summary = null;
-                if (tip != null && tip.isEmpty()) tip = null;
-                if (caution != null && caution.isEmpty()) caution = null;
-            } catch (Exception e) {
-                // Unparseable reply: fall through to the local template.
-                modelStatus = null;
+                readyDetectedFrames++;
+                if (now - readySinceMs >= READY_STABLE_MS && readyDetectedFrames >= 3) {
+                    readyStable = true;
+                }
             }
+        } else {
+            readySinceMs = null;
+            readyDetectedFrames = 0;
+            readyStable = false;
         }
-        if (modelStatus != null && modelStatus.equals(v.verdict)
-                && summary != null && tip != null) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("Model agrees with the local verdict (")
-                    .append(v.verdict).append(").\n");
-            sb.append(summary).append("\nTip: ").append(tip);
-            if (caution != null) sb.append("\nNote: ").append(caution);
-            return sb.toString();
-        }
-        return templateFeedback(v);
-    }
+        boolean aStable = readyStable;
 
-    // Deterministic fallback: the local verdict plus a fixed tip per
-    // verdict. Used when the model disagrees with the local verdict,
-    // when its reply cannot be parsed, or when the call fails.
-    private String templateFeedback(SequenceSession.Verdict v) {
-        switch (v.verdict) {
-            case "SUCCESS":
-                return "Local verdict: SUCCESS. The dog held '"
-                        + pretty(v.targetLabel)
-                        + "' for the full target. Praise and reward right "
-                        + "away. Next time, try a slightly longer target.";
-            case "EARLY_BREAK":
-                if (isReachThenHoldCommand(runCommand)) {
-                    if (v.targetReachedAtS == null) {
-                        return "Local verdict: EARLY_BREAK. The dog did "
-                                + "not reach '" + pretty(v.targetLabel)
-                                + "' within the 3s response window. Do not "
-                                + "reward. Next time, lure the dog into "
-                                + "position first and try again.";
+        boolean aUnsure = r.dogPresent && smoothed.equals(SequenceSession.UNCERTAIN_FRAME);
+        if (aUnsure) {
+            if (unsureSinceMs == null) unsureSinceMs = now;
+        } else {
+            unsureSinceMs = null;
+        }
+        GeminiClient gc = gemini();
+        if (aUnsure && readyRequired != null && unsureSinceMs != null
+                && now - unsureSinceMs >= ESCALATE_AFTER_MS
+                && now - lastEscalationMs >= ESCALATE_EVERY_MS
+                && r.cropBitmap != null && gc.configured()
+                && bReadyInFlight.compareAndSet(false, true)) {
+            lastEscalationMs = now;
+            final Bitmap crop = r.cropBitmap;
+            final int gen = readyGen.get();
+            runOnUiThread(() -> tvSeqStatus.setText("Model A is unsure - asking Model B (fine-tuned Gemini)..."));
+            boolean queued = netExecute(() -> {
+                GeminiClient.Reply rep = null;
+                try {
+                    rep = gc.tunedPosture(crop);
+                    // A reset (command change, attempt end, rotation)
+                    // since the crop was taken makes the answer stale.
+                    if (rep.ok() && gen == readyGen.get()) {
+                        // Validity is counted from the reply's ARRIVAL (a
+                        // Gemini call takes ~5 s, which would otherwise use
+                        // up the whole window). Time first, then label:
+                        // readers check the label first, so they never pair
+                        // a new label with an old time.
+                        bReadyAtMs = nowMs();
+                        bReadyLabel = rep.text;
                     }
-                    return "Local verdict: EARLY_BREAK. The dog reached '"
-                            + pretty(v.targetLabel) + "' but left it after "
-                            + String.format(Locale.US, "%.1f", v.heldS)
-                            + "s, before the 0.6s hold was complete. Do not "
-                            + "reward the break. Next time, reward the "
-                            + "moment the dog reaches the posture.";
+                } catch (RuntimeException e) {
+                    rep = null;
+                } finally {
+                    bReadyInFlight.set(false);
                 }
-                return "Local verdict: EARLY_BREAK. The dog held '"
-                        + pretty(v.targetLabel) + "' for "
-                        + String.format(Locale.US, "%.1f", v.heldS)
-                        + "s of the "
-                        + String.format(Locale.US, "%.0f", v.targetDurationS)
-                        + "s target. Do not reward the break. Next time "
-                        + "set a shorter target, below the held time, and "
-                        + "reduce distractions.";
-            default: // UNCERTAIN
-                return "Local verdict: UNCERTAIN. The attempt could not "
-                        + "be judged. Reposition the camera so the whole "
-                        + "dog is in frame and try again. Do not treat "
-                        + "this as a failure.";
+                final GeminiClient.Reply fr = rep;
+                runOnUiThread(() -> {
+                    if (running || gen != readyGen.get()) return;
+                    tvSeqStatus.setText(fr != null && fr.ok()
+                            ? "Model B says the dog is " + pretty(fr.text)
+                            + String.format(Locale.US, " (%.1f s).", fr.latencyMs / 1000.0)
+                            : "Model B unavailable: " + (fr == null ? "request failed" : fr.error));
+                });
+            });
+            if (!queued) bReadyInFlight.set(false);
+        }
+        String bl = bReadyLabel;
+        // Model B's confirmation holds for the whole window unless Model A
+        // CONFIDENTLY sees a different posture (not only while A is unsure:
+        // one confident frame would otherwise flicker the gate shut).
+        boolean aSeesOther = !smoothed.equals(SequenceSession.UNCERTAIN_FRAME)
+                && readyRequired != null && !smoothed.equals(readyRequired);
+        boolean bConfirms = readyRequired != null && bl != null && bl.equals(readyRequired)
+                && r.dogPresent && now - bReadyAtMs <= B_READY_VALID_MS && !aSeesOther;
+
+        boolean open = aStable || bConfirms;
+        if (open && !gateOpen) cues.ready();
+        gateOpen = open;
+        gateSource = aStable ? "Model A" : bConfirms ? "Model B" : "";
+        uiGateOpen = open;
+
+        final String msg;
+        if (!r.dogPresent) {
+            msg = "No dog in view. Frame the whole dog, side-on if possible.";
+        } else if (open) {
+            msg = readyRequired == null ? "Ready. Tap START, then give the command."
+                    : "Ready: the dog is " + pretty(readyRequired) + " (" + gateSource
+                    + "). Tap START, then give the command.";
+        } else if (aUnsure) {
+            msg = null; // keep any Model B status message on screen
+        } else {
+            msg = "Waiting for the starting posture: " + pretty(readyRequired)
+                    + " (now: " + pretty(smoothed) + ").";
+        }
+        runOnUiThread(() -> {
+            if (!running) {
+                if (msg != null) tvSeqStatus.setText(msg);
+                tvTimer.setText(uiGateOpen ? "READY" : "");
+                updateStartButton();
+            }
+        });
+    }
+
+    // START is enabled whenever an attempt could start, even with the gate
+    // closed: a disabled button gets no long-press, and long-press is the
+    // override for a gate that will not open. The click handler refuses a
+    // plain tap while the gate is closed; the dimmed look says "waiting".
+    private void updateStartButton() {
+        btnStartSeq.setEnabled(modelsReady && !running);
+        boolean waiting = !uiGateOpen && !running;
+        btnStartSeq.setText(waiting ? "START (waiting)" : "START");
+        btnStartSeq.setAlpha(waiting ? 0.6f : 1f);
+    }
+
+    // ---- the run --------------------------------------------------------
+
+    private String targetFor(String command, String stayLabel) {
+        switch (command) {
+            case "Sit": return "sitting";
+            case "Down": return "lying_down";
+            case "Stand": return "standing";
+            case "Walk": return "walking";
+            default: return stayLabel; // Stay holds the chosen posture
         }
     }
 
-    // ---- backend calls ---------------------------------------------------
-    // POST {prompt, imageBase64, mimeType}; returns the "text" field, or
-    // null on any failure. (MainActivity's callModel returns error
-    // strings for display; here null is meaningful - it marks the frame
-    // as a no-label frame for the state machine.)
-    private String postModel(String endpoint, String prompt, String imageBase64) {
-        HttpURLConnection conn = null;
+    // Proposal 5.2: Sit starts from Stand, Down starts from Sit, Stay
+    // starts from the posture it holds. Walk has no requirement.
+    private String requiredStartingLabel(String command, String stayLabel) {
+        switch (command) {
+            case "Sit": return "standing";
+            case "Down": return "sitting";
+            case "Stand": return "standing";
+            case "Walk": return null;
+            default: return stayLabel;
+        }
+    }
+
+    private static boolean isReachThenHold(String command) {
+        return "Sit".equals(command) || "Down".equals(command);
+    }
+
+    private void updateSpinnersEnabled() {
+        String cmd = COMMANDS[spCommand.getSelectedItemPosition()];
+        spStayPosture.setEnabled(!running && "Stay".equals(cmd));
+        spDuration.setEnabled(!running && !isReachThenHold(cmd));
+    }
+
+    private void startSequence(boolean override) {
+        if (!modelsReady || running) return;
+        final String cmd = COMMANDS[spCommand.getSelectedItemPosition()];
+        final String target = targetFor(cmd, STAY_LABELS[spStayPosture.getSelectedItemPosition()]);
+        final int dur = DURATION_SECONDS[spDuration.getSelectedItemPosition()];
+        running = true;
+        // Any cloud check still in flight belongs to the previous attempt:
+        // it must not fill the card this attempt will show.
+        cloudGen.incrementAndGet();
+        setControlsRunning(true);
+        layoutVerdict.setVisibility(View.GONE);
+        tvBanner.setVisibility(View.GONE);
+        tvSeqStatus.setText(isReachThenHold(cmd)
+                ? "Running: say \"" + cmd + "\" now. The dog has 3 s to reach "
+                + pretty(target) + ", then holds 0.6 s."
+                : "Running: " + cmd + " - hold " + pretty(target) + " for " + dur + " s.");
+        cues.go();
+        analysisExecutor.execute(() -> {
+            SequenceSession.Config cfg = new SequenceSession.Config(dur);
+            cfg.reachThenHold = isReachThenHold(cmd);
+            cfg.minConfidence = MIN_CONF;
+            session = new SequenceSession(target, cfg, cmd);
+            runCommand = cmd;
+            runDurationSec = dur;
+            runT0Ms = nowMs();
+            // The view the READY gate was judged on is kept for the whole
+            // attempt (see analyze()).
+            runExtraRotDeg = appliedExtraRotDeg;
+            keyframes.clear();
+            frameLatencies.clear();
+            reachedCued = false;
+            pipeline.resetTracking();
+            try {
+                log = new FrameLog(this, cmd);
+            } catch (Exception e) {
+                log = null;
+            }
+            startedWithOverride = override;
+            startGateSource = override ? "override" : gateSource;
+        });
+    }
+
+    private volatile boolean replayMode = false;
+    private volatile boolean replayDone = false;
+    private boolean startedWithOverride;  // [A]
+    private String startGateSource = "";  // [A]
+
+    private void stopSequence() {
         try {
-            JSONObject payload = new JSONObject();
-            payload.put("prompt", prompt);
-            payload.put("mimeType", "image/jpeg");
-            payload.put("imageBase64", imageBase64);
-
-            conn = (HttpURLConnection) new URL(endpoint).openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            // Shorter than the photo flow's 60s: a hung call must not
-            // stall the 1 fps sampler for a whole minute. A timeout just
-            // makes this frame a no-label frame.
-            conn.setConnectTimeout(20000);
-            conn.setReadTimeout(20000);
-            conn.setDoOutput(true);
-            OutputStream out = conn.getOutputStream();
-            out.write(payload.toString().getBytes(StandardCharsets.UTF_8));
-            out.close();
-
-            int code = conn.getResponseCode();
-            InputStream in = code >= 200 && code < 300
-                    ? conn.getInputStream() : conn.getErrorStream();
-            String raw = readAll(in);
-            if (code < 200 || code >= 300) return null;
-            return new JSONObject(raw).optString("text", null);
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
+            analysisExecutor.execute(() -> {
+                // A plain Runnable: an exception here would kill the
+                // analysis thread and, on Android, the app.
+                try {
+                    if (session != null && !session.isDecided()) onVerdict(session.finish());
+                } catch (Throwable e) {
+                    runOnUiThread(() -> tvSeqStatus.setText("Could not finish the attempt: " + e.getMessage()));
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Activity already destroyed.
         }
     }
 
-    private String readAll(InputStream in) throws Exception {
-        if (in == null) return "{}";
-        BufferedReader r = new BufferedReader(
-                new InputStreamReader(in, StandardCharsets.UTF_8));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = r.readLine()) != null) sb.append(line);
-        r.close();
-        return sb.toString();
+    // [A]
+    private void onVerdict(SequenceSession.Verdict v) {
+        final String cmd = runCommand;
+        final int dur = runDurationSec;
+        final List<KeyFrame> decisive = pickDecisiveFrames(v, keyframes);
+        final FrameLog lg = log;
+        if (lg != null) lg.close();
+        log = null;
+        long sum = 0;
+        List<Long> sorted = new ArrayList<>(frameLatencies);
+        java.util.Collections.sort(sorted);
+        for (long x : sorted) sum += x;
+        final long medianMs = sorted.isEmpty() ? 0 : sorted.get(sorted.size() / 2);
+        final long p90Ms = sorted.isEmpty() ? 0 : sorted.get((int) Math.min(sorted.size() - 1, sorted.size() * 0.9));
+        final double runS = v.nFrames == 0 ? 0 : (nowMs() - runT0Ms) / 1000.0;
+        final double fps = runS > 0 ? v.nFrames / runS : 0;
+        final boolean override = startedWithOverride;
+        final String gateBy = startGateSource;
+        session = null;
+        resetReadinessOnAnalysis();
+
+        lastVerdict = v;
+        lastKeyframes = decisive;
+        lastCommand = cmd;
+        lastDuration = dur;
+        lastLog = lg;
+
+        runOnUiThread(() -> {
+            running = false;
+            setControlsRunning(false);
+            showVerdict(v, cmd, medianMs, p90Ms, fps, override, gateBy);
+            cues.verdict(v.verdict, spokenVerdict(v, cmd));
+        });
+        if (lg != null) {
+            try {
+                JSONObject s = verdictJson(v, cmd, dur);
+                s.put("on_device_median_frame_ms", medianMs);
+                s.put("on_device_p90_frame_ms", p90Ms);
+                s.put("analysed_fps", fps);
+                s.put("ready_gate", gateBy);
+                lg.summary(s);
+            } catch (Exception ignored) {
+            }
+        }
+        runCloudChecks(v, decisive, cmd, dur, lg);
     }
 
-    // Parse a model reply to a canonical label. The tuned model was asked
-    // for exactly one word, but the v3 evaluation showed it sometimes
-    // answers in a sentence ("The dog is standing."), so this is a simple
-    // keyword scan; anything unrecognisable is a no-label frame (null).
-    //
-    // Confidence thresholding (proposal 5.3: ignore classifications
-    // under 0.65 confidence as Undefined) is NOT implementable here:
-    // the tuned endpoint returns text only, with no confidence score
-    // to threshold. Nothing is faked - an unparseable reply simply
-    // becomes a no-label frame for the state machine.
-    private String parseLabel(String text) {
-        String s = text.trim().toLowerCase(Locale.US);
-        if (s.contains("lying") || s.equals("down")) return "lying_down";
-        if (s.contains("sitting")) return "sitting";
-        if (s.contains("standing")) return "standing";
-        if (s.contains("walking")) return "walking";
+    // [A] The frames that decided the verdict, for Model B to re-check.
+    // Each one is also given what the VERDICT claims about it
+    // (expectTarget), because that claim - not Model A's label on the
+    // frame - is what Model B has to confirm. A wrong verdict usually
+    // comes from smoothing lag, and then Model A's raw label on the
+    // decisive frame already contradicts the verdict: comparing Model B
+    // with Model A would print VERIFIED for exactly those wrong verdicts.
+    static List<KeyFrame> pickDecisiveFrames(SequenceSession.Verdict v, List<KeyFrame> all) {
+        List<KeyFrame> out = new ArrayList<>();
+        if (all.isEmpty()) return out;
+        if (v.targetReachedAtS != null) addNear(out, all, v.targetReachedAtS, "target reached");
+        if (v.breakAtS != null) addBreakFrame(out, all, v.breakAtS, v.targetLabel);
+        KeyFrame last = all.get(all.size() - 1);
+        boolean have = false;
+        for (KeyFrame k : out) if (k.t == last.t) have = true;
+        if (!have) out.add(copy(last, "last frame"));
+        for (KeyFrame k : out) {
+            k.expectTarget = expectationFor(v, k.role);
+            // Fallback break frame (no confident non-target crop at/after
+            // breakAt): Model A itself did not see a wrong posture on it, so
+            // the verdict makes no claim about it - Model B's view is
+            // reported but not counted as agree/dispute.
+            if ("first wrong posture".equals(k.role) && !isConfidentNonTarget(k, v.targetLabel)) {
+                k.expectTarget = null;
+            }
+        }
+        return out;
+    }
+
+    // KeyFrame.label is only set when Model A was confident (>= MIN_CONF).
+    private static boolean isConfidentNonTarget(KeyFrame k, String target) {
+        return k.label != null && !k.label.equals(target);
+    }
+
+    // The "first wrong posture" frame. After an unclear gap breakAtS can
+    // point at the START of the gap, so the first keyframe at/after it may
+    // be a half-risen transition crop that Model A was unsure about; giving
+    // it expectTarget=false let Model B call a correct EARLY_BREAK DISPUTED.
+    // So pick the first keyframe at/after breakAt that Model A confidently
+    // labelled as NOT the target; if there is none, fall back to addNear
+    // (pickDecisiveFrames then gives that frame no expectation).
+    private static void addBreakFrame(List<KeyFrame> out, List<KeyFrame> all, double t, String target) {
+        for (KeyFrame k : all) {
+            if (k.t >= t - 1e-6 && isConfidentNonTarget(k, target)) {
+                for (KeyFrame o : out) if (o.t == k.t) return;
+                out.add(copy(k, "first wrong posture"));
+                return;
+            }
+        }
+        addNear(out, all, t, "first wrong posture");
+    }
+
+    // What the verdict says the dog was doing on a decisive frame:
+    //   target reached               -> in the target posture
+    //   first wrong posture          -> NOT in the target posture
+    //   last frame of a SUCCESS      -> in the target posture
+    //   last frame of an EARLY_BREAK -> NOT in it (after a break, or the
+    //                                   target was never reached)
+    //   last frame of a LATE reach   -> no claim: the dog did get there,
+    //     (EARLY_BREAK, reached, no     only after the 3 s window. Lateness
+    //      break time)                  is timing Model B cannot check.
+    //   any frame of an UNCERTAIN    -> no claim (null)
+    static Boolean expectationFor(SequenceSession.Verdict v, String role) {
+        if ("UNCERTAIN".equals(v.verdict)) return null;
+        if ("target reached".equals(role)) return Boolean.TRUE;
+        if ("first wrong posture".equals(role)) return Boolean.FALSE;
+        if ("last frame".equals(role)) {
+            if ("SUCCESS".equals(v.verdict)) return Boolean.TRUE;
+            if ("EARLY_BREAK".equals(v.verdict)) {
+                boolean lateReach = v.breakAtS == null && v.targetReachedAtS != null;
+                return lateReach ? null : Boolean.FALSE;
+            }
+        }
         return null;
     }
 
-    // Downscale to ~640px wide (the dataset/backend frame size) and
-    // re-encode as JPEG so the JSON body stays small.
-    private byte[] toJpeg640(Bitmap bmp) {
-        Bitmap use = bmp;
-        if (bmp.getWidth() > 640) {
-            float scale = 640f / bmp.getWidth();
-            use = Bitmap.createScaledBitmap(bmp, 640,
-                    Math.round(bmp.getHeight() * scale), true);
+    // Does Model B's label support the verdict's claim on this frame?
+    // null when there is no claim or no answer.
+    static Boolean supportsVerdict(Boolean expectTarget, String bLabel, String target) {
+        if (expectTarget == null || bLabel == null) return null;
+        return expectTarget.booleanValue() == bLabel.equals(target);
+    }
+
+    static String expectedText(Boolean expectTarget, String target) {
+        if (expectTarget == null) return null;
+        return expectTarget ? pretty(target) : "not " + pretty(target);
+    }
+
+    // The ONE status line for Model B's check of a verdict, used for the
+    // card, the coaching prompt and the attempt JSON. bLabels.get(i) is
+    // Model B's canonical label for frames.get(i), null = no answer.
+    //   NOT CHECKED    no answer at all; or the verdict is UNCERTAIN (it
+    //                  claims nothing to check); or a frame that decided
+    //                  the verdict (target reached / first wrong posture)
+    //                  got no answer
+    //   DISPUTED       Model B contradicts the verdict on some key frame
+    //   PARTLY CHECKED Model B supports every key frame it answered, but
+    //                  some other key frame got no answer
+    //   VERIFIED       Model B answered every key frame and supports the
+    //                  verdict on all of them
+    // An unanswered frame is never silently dropped: "1/1 agree" when the
+    // break frame timed out would claim a check that did not happen.
+    static String buildCheckStatus(SequenceSession.Verdict v, List<KeyFrame> frames, List<String> bLabels) {
+        int answered = 0, withClaim = 0, support = 0;
+        String dispute = null;
+        List<String> missing = new ArrayList<>();
+        List<String> missingDeciding = new ArrayList<>();
+        for (int i = 0; i < frames.size(); i++) {
+            KeyFrame k = frames.get(i);
+            String b = bLabels.get(i);
+            if (b == null) {
+                missing.add(k.role);
+                if ("target reached".equals(k.role) || "first wrong posture".equals(k.role)) {
+                    missingDeciding.add(k.role);
+                }
+                continue;
+            }
+            answered++;
+            Boolean sup = supportsVerdict(k.expectTarget, b, v.targetLabel);
+            if (sup == null) continue;
+            withClaim++;
+            if (sup) {
+                support++;
+            } else if (dispute == null) {
+                dispute = String.format(Locale.US,
+                        "at %.1f s (%s) Model B sees %s, but the verdict says the dog was %s",
+                        k.t, k.role, pretty(b), expectedText(k.expectTarget, v.targetLabel));
+            }
+        }
+        if (answered == 0) {
+            return "NOT CHECKED - Model B gave no answer. The on-device verdict stands unchecked.";
+        }
+        if ("UNCERTAIN".equals(v.verdict)) {
+            return "NOT CHECKED - the verdict is UNCERTAIN, so there is nothing for Model B to confirm. "
+                    + "What Model B sees on the key frames is listed for information only.";
+        }
+        if (dispute != null) {
+            return "DISPUTED - " + dispute + ". Treat this verdict with caution."
+                    + (missing.isEmpty() ? "" : " (" + missing.size() + " key frame(s) not answered.)");
+        }
+        String agrees = "Model B agrees with the verdict on " + support + "/" + withClaim
+                + " key frame" + (withClaim == 1 ? "" : "s");
+        if (!missingDeciding.isEmpty()) {
+            return "NOT CHECKED - no Model B answer for the " + String.join(" and ", missingDeciding)
+                    + " frame, which decided this verdict. " + agrees + " that it did answer.";
+        }
+        if (!missing.isEmpty()) {
+            return "PARTLY CHECKED - " + agrees + "; no answer for the " + String.join(", ", missing)
+                    + ". The verdict is not fully verified.";
+        }
+        if (withClaim < answered) {
+            return "PARTLY CHECKED - " + agrees + ".";
+        }
+        return "VERIFIED - " + agrees + ".";
+    }
+
+    private static void addNear(List<KeyFrame> out, List<KeyFrame> all, double t, String role) {
+        KeyFrame best = null;
+        for (KeyFrame k : all) {
+            if (k.t >= t - 1e-6) {
+                best = k;
+                break;
+            }
+        }
+        if (best == null) best = all.get(all.size() - 1);
+        for (KeyFrame k : out) if (k.t == best.t) return;
+        out.add(copy(best, role));
+    }
+
+    private static KeyFrame copy(KeyFrame k, String role) {
+        KeyFrame c = new KeyFrame();
+        c.t = k.t;
+        c.label = k.label;
+        c.conf = k.conf;
+        c.jpeg = k.jpeg;
+        c.role = role;
+        c.expectTarget = k.expectTarget;
+        return c;
+    }
+
+    // ---- cloud checks: Model B verification + base Gemini coaching -------
+
+    private void runCloudChecks(SequenceSession.Verdict v, List<KeyFrame> decisive,
+                                String cmd, int dur, FrameLog lg) {
+        final GeminiClient gc = gemini();
+        // This check's generation. onVerdict, the re-check button and START
+        // all bump it, so only the newest check may write the card. The log
+        // has its own per-attempt generation (FrameLog.beginCheck), so a
+        // check still running when the next attempt starts still saves its
+        // results to its own attempt's file.
+        final int gen = cloudGen.incrementAndGet();
+        final int logGen = lg != null ? lg.beginCheck() : 0;
+        runOnUiThread(() -> {
+            if (gen != cloudGen.get()) return;
+            tvModelB.setText(decisive.isEmpty() ? "No dog frames to check."
+                    : "Checking " + decisive.size() + " decisive frame(s) with Model B...");
+            tvSeqFeedback.setText("(waiting for Gemini...)");
+        });
+        if (!gc.configured()) {
+            runOnUiThread(() -> {
+                if (gen != cloudGen.get()) return;
+                tvModelB.setText("Backend URL not set - verdict not checked by Model B.");
+                tvSeqFeedback.setText(templateTip(v, cmd));
+            });
+            return;
+        }
+        boolean queued = netExecute(() -> {
+            List<Future<GeminiClient.Reply>> futures = new ArrayList<>();
+            for (KeyFrame k : decisive) {
+                Future<GeminiClient.Reply> f;
+                try {
+                    f = netPool.submit(() -> gc.post("/api/fine-tuned-gemini",
+                            GeminiClient.POSTURE_PROMPT, android.util.Base64.encodeToString(k.jpeg,
+                                    android.util.Base64.NO_WRAP)));
+                } catch (RejectedExecutionException e) {
+                    // Pool shut down between submits (activity closing): a
+                    // failed answer keeps futures index-aligned with decisive.
+                    GeminiClient.Reply fail = new GeminiClient.Reply();
+                    fail.error = "app closing";
+                    f = CompletableFuture.completedFuture(fail);
+                }
+                futures.add(f);
+            }
+            StringBuilder sb = new StringBuilder();
+            int failed = 0;
+            List<String> bLabels = new ArrayList<>();
+            JSONArray checks = new JSONArray();
+            for (int i = 0; i < decisive.size(); i++) {
+                KeyFrame k = decisive.get(i);
+                GeminiClient.Reply rep;
+                try {
+                    rep = futures.get(i).get();
+                } catch (Exception e) {
+                    rep = new GeminiClient.Reply();
+                    rep.error = e.getMessage();
+                }
+                String bLabel = rep.ok() ? GeminiClient.parseLabel(rep.text) : null;
+                bLabels.add(bLabel);
+                String expected = expectedText(k.expectTarget, v.targetLabel);
+                Boolean supports = supportsVerdict(k.expectTarget, bLabel, v.targetLabel);
+                JSONObject c = new JSONObject();
+                try {
+                    c.put("role", k.role);
+                    c.put("t_s", k.t);
+                    // What the verdict claims on this frame, and whether
+                    // Model B's answer supports it (null = no claim / no answer).
+                    c.put("verdict_expects", expected == null ? JSONObject.NULL : expected);
+                    c.put("model_b_supports_verdict", supports == null ? JSONObject.NULL : supports);
+                    c.put("model_a", k.label == null ? JSONObject.NULL : k.label);
+                    c.put("model_a_conf", k.conf);
+                    c.put("model_b", bLabel == null ? JSONObject.NULL : bLabel);
+                    c.put("model_b_agrees_with_model_a", bLabel == null || k.label == null
+                            ? JSONObject.NULL : bLabel.equals(k.label));
+                    c.put("model_b_raw", rep.text == null ? JSONObject.NULL : rep.text);
+                    c.put("latency_ms", rep.latencyMs);
+                    c.put("error", rep.error == null ? JSONObject.NULL : rep.error);
+                } catch (Exception ignored) {
+                }
+                checks.put(c);
+                String aShow = k.label == null ? "unsure" : pretty(k.label);
+                String claim = expected == null ? "" : "verdict says " + expected + "; ";
+                if (bLabel == null) {
+                    failed++;
+                    sb.append(String.format(Locale.US, "\u2022 %.1f s, %s: %sModel B gave no answer (%s). Model A: %s\n",
+                            k.t, k.role, claim, rep.error == null ? "unparseable reply" : rep.error, aShow));
+                    continue;
+                }
+                String outcome = supports == null ? "" : supports ? " - agrees" : " - CONTRADICTS the verdict";
+                sb.append(String.format(Locale.US, "\u2022 %.1f s, %s: %sModel B sees %s%s (%.1f s). Model A: %s\n",
+                        k.t, k.role, claim, pretty(bLabel), outcome, rep.latencyMs / 1000.0, aShow));
+            }
+            final String status = buildCheckStatus(v, decisive, bLabels);
+            final String bText = status + "\n" + sb.toString().trim();
+            runOnUiThread(() -> {
+                if (gen == cloudGen.get()) tvModelB.setText(bText);
+            });
+
+            // Coaching from base Gemini, given the verdict (explain, do
+            // not re-judge) and Model B's check.
+            KeyFrame img = null;
+            for (KeyFrame k : decisive) if ("first wrong posture".equals(k.role)) img = k;
+            if (img == null && !decisive.isEmpty()) img = decisive.get(decisive.size() - 1);
+            String tipText;
+            long coachMs = -1;
+            boolean jsonOk = false;
+            if (img == null) {
+                tipText = "App tip (no frame to send): " + templateTip(v, cmd);
+            } else {
+                GeminiClient.Reply rep = gc.post("/api/gemini", coachingPrompt(v, cmd, dur, status),
+                        android.util.Base64.encodeToString(img.jpeg, android.util.Base64.NO_WRAP));
+                coachMs = rep.latencyMs;
+                JSONObject j = rep.ok() ? parseJsonLoose(rep.text) : null;
+                if (j != null && !j.optString("coaching_tip", "").isEmpty()) {
+                    jsonOk = true;
+                    StringBuilder t = new StringBuilder();
+                    String sum = j.optString("evidence_summary", "");
+                    if (!sum.isEmpty()) t.append(sum).append("\n");
+                    t.append("Tip: ").append(j.optString("coaching_tip"));
+                    String caution = j.optString("caution", "");
+                    if (!caution.isEmpty() && !"null".equals(caution)) t.append("\nNote: ").append(caution);
+                    t.append(String.format(Locale.US, "\n(base Gemini, %.1f s)", rep.latencyMs / 1000.0));
+                    tipText = t.toString();
+                } else {
+                    tipText = "App tip (Gemini " + (rep.ok() ? "reply was not valid JSON" : "unavailable: " + rep.error)
+                            + "): " + templateTip(v, cmd);
+                }
+            }
+            final String show = tipText;
+            runOnUiThread(() -> {
+                if (gen == cloudGen.get()) tvSeqFeedback.setText(show);
+            });
+            // FrameLog.summary() merges last-writer-wins, so an older check
+            // finishing after a newer re-check of the SAME attempt would
+            // overwrite the newer Model B fields: only that log's newest
+            // check writes it.
+            if (lg != null && lg.isLatestCheck(logGen)) {
+                try {
+                    // FrameLog.summary() merges, so the on-device fields
+                    // written at the verdict survive this write.
+                    JSONObject s = verdictJson(v, cmd, dur);
+                    s.put("model_b_status", status);
+                    s.put("model_b_checks", checks);
+                    s.put("model_b_unanswered", failed);
+                    s.put("coaching_json_valid", jsonOk);
+                    s.put("coaching_latency_ms", coachMs);
+                    s.put("coaching_text", show);
+                    lg.summary(s);
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        if (!queued) {
+            runOnUiThread(() -> {
+                if (gen == cloudGen.get()) tvModelB.setText("NOT CHECKED - the app is closing.");
+            });
+        }
+    }
+
+    // netPool.execute that never throws: after onDestroy has shut the
+    // pool down, a rejected task would otherwise escape a plain Runnable
+    // on the analysis thread and crash the app. Returns false if rejected.
+    private boolean netExecute(Runnable task) {
+        try {
+            netPool.execute(task);
+            return true;
+        } catch (RejectedExecutionException e) {
+            return false;
+        }
+    }
+
+    private String coachingPrompt(SequenceSession.Verdict v, String cmd, int dur, String bStatus) {
+        List<String> timeline = new ArrayList<>();
+        // Thin the ~5 fps timeline to ~2 labels per second for the prompt.
+        double lastT = -1;
+        for (String step : v.smoothedSequence) {
+            int sp = step.indexOf(' ');
+            double t = Double.parseDouble(step.substring(0, sp));
+            if (t - lastT >= 0.5) {
+                timeline.add(step.substring(0, sp) + "s " + pretty(step.substring(sp + 1)));
+                lastT = t;
+            }
+        }
+        String rule = isReachThenHold(cmd)
+                ? "reach the target posture within 3 seconds, then hold it 0.6 seconds"
+                : "hold the target posture for " + dur + " seconds";
+        return "You are a positive-reinforcement dog trainer. A phone app already judged this "
+                + "training attempt; do NOT re-judge it, explain it and coach the owner.\n"
+                + "Command: " + cmd + ". Rule: " + rule + ". Target posture: " + pretty(v.targetLabel) + ".\n"
+                + "App verdict: " + v.verdict + " - " + v.reason + ".\n"
+                + String.format(Locale.US, "Held: %.1f s.", v.heldS)
+                + (v.breakAtS != null ? String.format(Locale.US, " First wrong posture at %.1f s.", v.breakAtS) : "")
+                + "\nPosture timeline: " + String.join(", ", timeline) + ".\n"
+                + "Independent check by a second model: " + bStatus + "\n"
+                + "The image is the decisive frame. Reply with a JSON object only, no other text, "
+                + "with exactly these fields: \"evidence_summary\" (one sentence on what happened), "
+                + "\"coaching_tip\" (one short, concrete next step), \"caution\" (one short sentence "
+                + "or null).";
+    }
+
+    static JSONObject parseJsonLoose(String text) {
+        if (text == null) return null;
+        String s = text.trim();
+        int a = s.indexOf('{'), b = s.lastIndexOf('}');
+        if (a < 0 || b <= a) return null;
+        try {
+            return new JSONObject(s.substring(a, b + 1));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String templateTip(SequenceSession.Verdict v, String cmd) {
+        switch (v.verdict) {
+            case "SUCCESS":
+                return "Praise and reward right away. Next time, try a slightly longer target.";
+            case "EARLY_BREAK":
+                if (isReachThenHold(cmd) && v.targetReachedAtS == null) {
+                    return "No reward. Lure the dog into " + pretty(v.targetLabel)
+                            + " first, then fade the lure.";
+                }
+                return String.format(Locale.US, "No reward for the break. Next time set a target "
+                        + "shorter than %.1f s and reduce distractions.", v.heldS);
+            default:
+                return "Move the phone so the whole dog is in frame, side-on, in good light, and try again.";
+        }
+    }
+
+    // ---- UI -------------------------------------------------------------
+
+    private void updateLiveUi(SequenceSession s) {
+        if (s == null || !running) return;
+        double t = s.getLastT() == null ? 0 : s.getLastT();
+        if (s.isReachThenHold() && "RESPONSE".equals(s.getPhase())) {
+            double win = s.getConfig().responseWindowS;
+            tvTimer.setText(String.format(Locale.US, "respond %.1f / %.0f s", Math.min(t, win), win));
+            progressSeq.setProgress((int) Math.min(100, 100 * t / win));
+            tvSeqProgress.setText("Waiting for the dog to reach " + pretty(s.getTargetLabel()) + "...");
+        } else {
+            double held = s.getReachedAt() == null ? 0 : Math.max(0, t - s.getReachedAt());
+            double need = s.holdRequiredS();
+            tvTimer.setText(String.format(Locale.US, "held %.1f / %.1f s", Math.min(held, need), need));
+            progressSeq.setProgress((int) Math.min(100, 100 * held / need));
+            tvSeqProgress.setText(s.getReachedAt() == null
+                    ? "Waiting for " + pretty(s.getTargetLabel()) + "..."
+                    : String.format(Locale.US, "Holding %s · t = %.1f s · %d frames judged on the phone",
+                    pretty(s.getTargetLabel()), t, s.getFrameCount()));
+        }
+    }
+
+    private void showVerdict(SequenceSession.Verdict v, String cmd, long medianMs, long p90Ms,
+                             double fps, boolean override, String gateBy) {
+        layoutVerdict.setVisibility(View.VISIBLE);
+        int color = "SUCCESS".equals(v.verdict) ? Color.rgb(46, 125, 50)
+                : "EARLY_BREAK".equals(v.verdict) ? Color.rgb(198, 40, 40) : Color.rgb(97, 97, 97);
+        tvBanner.setText(v.verdict.replace('_', ' '));
+        tvBanner.setBackgroundColor(color);
+        tvBanner.setVisibility(View.VISIBLE);
+        tvBanner.postDelayed(() -> tvBanner.setVisibility(View.GONE), 4000);
+        tvSeqVerdict.setText(v.verdict.replace('_', ' '));
+        tvSeqVerdict.setTextColor(color);
+        tvSeqStatus.setText("Attempt finished: " + v.verdict + ". Get the dog back into the starting posture to go again.");
+        tvTimer.setText("");
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(cmd).append(" → ").append(pretty(v.targetLabel)).append('\n');
+        sb.append(String.format(Locale.US, "Held %.1f s", v.heldS));
+        if (v.breakAtS != null) sb.append(String.format(Locale.US, " · first wrong posture at %.1f s", v.breakAtS));
+        if (v.targetReachedAtS != null) sb.append(String.format(Locale.US, " · reached at %.1f s", v.targetReachedAtS));
+        sb.append('\n').append("Why: ").append(v.reason).append('\n');
+        sb.append(String.format(Locale.US, "%d frames judged on the phone (%.1f fps), %.0f%% unclear; "
+                        + "on-device latency median %d ms, p90 %d ms per frame.",
+                v.nFrames, fps, v.uncertainRatio * 100, medianMs, p90Ms));
+        sb.append("\nStarted by: ").append(override ? "long-press override (no READY check)"
+                : "READY gate (" + gateBy + ")");
+        tvSeqDetails.setText(sb.toString());
+    }
+
+    private String spokenVerdict(SequenceSession.Verdict v, String cmd) {
+        switch (v.verdict) {
+            case "SUCCESS":
+                return isReachThenHold(cmd) ? "Success. Good " + cmd.toLowerCase(Locale.US) + "."
+                        : String.format(Locale.US, "Success. Held %.0f seconds.", v.targetDurationS);
+            case "EARLY_BREAK":
+                if (v.breakAtS != null) return String.format(Locale.US, "Break at %.1f seconds.", v.breakAtS);
+                return "No " + cmd.toLowerCase(Locale.US) + " within three seconds.";
+            default:
+                return "Uncertain. I could not see the dog clearly.";
+        }
+    }
+
+    private void setControlsRunning(boolean isRunning) {
+        btnStopSeq.setEnabled(isRunning);
+        spCommand.setEnabled(!isRunning);
+        updateSpinnersEnabled();
+        etSeqUrl.setEnabled(!isRunning);
+        updateStartButton();
+    }
+
+    private void shareLog() {
+        FrameLog lg = lastLog;
+        if (lg == null) {
+            Toast.makeText(this, "No attempt log yet", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        ArrayList<Uri> uris = new ArrayList<>();
+        String auth = getPackageName() + ".fileprovider";
+        for (java.io.File f : Arrays.asList(lg.csvFile(), lg.jsonFile())) {
+            if (f.exists()) uris.add(FileProvider.getUriForFile(this, auth, f));
+        }
+        Intent i = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        i.setType("text/plain");
+        i.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivity(Intent.createChooser(i, "Share attempt log"));
+    }
+
+    // ---- helpers ----------------------------------------------------------
+
+    private GeminiClient gemini() {
+        return new GeminiClient(etSeqUrlText);
+    }
+
+    // The one clock every time-based rule uses: wall clock live, clip
+    // time (frame index / clipFps) in replay. r.elapsedMs is on the same
+    // clock (startReplay overwrites it per frame).
+    private long nowMs() {
+        return replayMode ? replayClockMs : SystemClock.elapsedRealtime();
+    }
+
+    // The extra clockwise rotation that turns a screen-upright frame
+    // world-upright (see analyze() for the direction).
+    private int worldRotationDeg() {
+        int dev = deviceRotDeg;
+        return frontLens ? (360 - dev) % 360 : dev;
+    }
+
+    // Snap an OrientationEventListener angle (0-359, clockwise) to 0/90/
+    // 180/270, with hysteresis: the current value is kept until the phone
+    // is ROTATION_HYSTERESIS_DEG past the 45 deg midpoint, so a tripod
+    // mounted near 45 deg does not flip the frame (and reset the READY
+    // gate) on every bit of sensor noise.
+    static int quantizeRotation(int deg, int current) {
+        int diff = Math.abs(((deg - current) % 360 + 540) % 360 - 180);
+        if (diff <= 45 + ROTATION_HYSTERESIS_DEG) return current;
+        return ((deg + 45) / 90 % 4) * 90;
+    }
+
+    @SuppressWarnings("deprecation")
+    private int currentDisplayRotationDeg() {
+        switch (getWindowManager().getDefaultDisplay().getRotation()) {
+            case Surface.ROTATION_90: return 90;
+            case Surface.ROTATION_180: return 180;
+            case Surface.ROTATION_270: return 270;
+            default: return 0;
+        }
+    }
+
+    private volatile String etSeqUrlText = MainActivity.BACKEND_URL;
+
+    private static JSONObject verdictJson(SequenceSession.Verdict v, String cmd, int dur) throws Exception {
+        JSONObject s = new JSONObject();
+        s.put("command", cmd);
+        s.put("target", v.targetLabel);
+        s.put("target_duration_s", dur);
+        s.put("verdict", v.verdict);
+        s.put("reason", v.reason);
+        s.put("held_s", v.heldS);
+        s.put("reached_at_s", v.targetReachedAtS == null ? JSONObject.NULL : v.targetReachedAtS);
+        s.put("break_at_s", v.breakAtS == null ? JSONObject.NULL : v.breakAtS);
+        s.put("n_frames", v.nFrames);
+        s.put("uncertain_ratio", v.uncertainRatio);
+        return s;
+    }
+
+    private static byte[] smallJpeg(Bitmap crop) {
+        Bitmap use = crop;
+        int m = Math.max(crop.getWidth(), crop.getHeight());
+        if (m > KEYFRAME_MAX_SIDE) {
+            float s = KEYFRAME_MAX_SIDE / (float) m;
+            use = Bitmap.createScaledBitmap(crop, Math.max(1, Math.round(crop.getWidth() * s)),
+                    Math.max(1, Math.round(crop.getHeight() * s)), true);
         }
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        use.compress(Bitmap.CompressFormat.JPEG, 80, baos);
+        use.compress(Bitmap.CompressFormat.JPEG, 85, baos);
+        if (use != crop) use.recycle();
         return baos.toByteArray();
     }
 
-    private String pretty(String label) {
+    static String pretty(String label) {
         if (label == null) return "-";
         if (label.equals("lying_down")) return "lying down";
-        if (label.equals(SequenceSession.UNCERTAIN_FRAME)) return "no label";
+        if (label.equals(SequenceSession.UNCERTAIN_FRAME)) return "unclear";
         return label;
     }
 
-    // ---- lifecycle ------------------------------------------------------
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        paused = true;
-        stopReadiness();
-        // Judging stops with the screen; finish() still leaves a verdict
-        // on screen for when the user comes back.
-        if (running) stopSequence(false);
-    }
+    // ---- lifecycle --------------------------------------------------------
 
     @Override
     protected void onResume() {
         super.onResume();
-        paused = false;
-        // If no sequence is running, the READY gate resumes watching
-        // for the starting posture - even with a verdict still showing,
-        // so START can be tapped again once the dog is back in position.
-        // (startReadiness is a no-op if it is already running.)
-        if (!running) {
-            startReadiness();
+        displayRotDeg = currentDisplayRotationDeg();
+        if (orientationListener != null && orientationListener.canDetectOrientation()) {
+            orientationListener.enable();
         }
+        // The denial message sends the user to Settings; when they come
+        // back with the permission granted, start the camera here, since
+        // onCreate (the only other place) does not run again.
+        if (!replayRequested && !cameraStarted
+                && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            cameraDenied = false;
+            startCamera();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (orientationListener != null) orientationListener.disable();
+        // An attempt the trainer cannot see is ended, not left running.
+        if (running) stopSequence();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        running = false;
-        if (sampleFuture != null) sampleFuture.cancel(false);
-        sampler.shutdownNow();
-        closeCamera();
-        if (cameraThread != null) cameraThread.quitSafely();
+        replayTimer.shutdownNow();
+        // netPool is shut down from the analysis thread AFTER the close
+        // task: the executor is single-threaded and FIFO, so a verdict
+        // still queued (onPause's stop task, or the frame in progress)
+        // hands its Model B work to netPool while netPool still accepts it.
+        // (runCloudChecks also survives a rejected submit on its own.)
+        analysisExecutor.execute(() -> {
+            if (detector != null) detector.close();
+            if (classifier != null) classifier.close();
+            netPool.shutdown();
+        });
+        analysisExecutor.shutdown();
+        if (cues != null) cues.shutdown();
     }
 }

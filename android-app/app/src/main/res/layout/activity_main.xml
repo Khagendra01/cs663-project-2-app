@@ -12,14 +12,14 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/app_name"
+            android:text="Model lab"
             android:textSize="22sp"
             android:textStyle="bold" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Base Gemini vs fine-tuned Gemini, same photo and prompt"
+            android:text="One photo through every model: Model C (dog detector) and Model A (our posture classifier) on the phone, then base vs fine-tuned Gemini (Model B) in the cloud."
             android:layout_marginBottom="16dp" />
 
         <TextView
@@ -51,7 +51,7 @@
             android:id="@+id/imgPreview"
             android:layout_width="match_parent"
             android:layout_height="220dp"
-            android:scaleType="centerCrop"
+            android:scaleType="fitCenter"
             android:layout_marginTop="12dp"
             android:contentDescription="Selected dog photo" />
 
@@ -79,7 +79,7 @@
             android:id="@+id/btnSequence"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="3. Open Sequence mode (Start Sequence)"
+            android:text="Back to the training assistant"
             android:layout_marginTop="12dp" />
 
         <TextView
@@ -88,6 +88,22 @@
             android:layout_height="wrap_content"
             android:text="Take or pick a picture first."
             android:layout_marginTop="16dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="On the phone: Model C + Model A"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            android:layout_marginTop="20dp" />
+
+        <TextView
+            android:id="@+id/tvLocal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="(no photo yet)"
+            android:background="#FFF8E1"
+            android:padding="12dp" />
 
         <TextView
             android:layout_width="wrap_content"

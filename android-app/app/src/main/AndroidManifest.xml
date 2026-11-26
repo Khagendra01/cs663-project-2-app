@@ -2,28 +2,52 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Sequence mode uses the camera directly (Camera2 live preview);
-         the single-photo flow above does not need it because it launches
-         the system camera app instead. Requested at runtime in
-         SequenceActivity. -->
+    <!-- Live camera (CameraX) in the training assistant, and the system
+         camera in the Model lab. Requested at runtime. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Haptic cues (Cues.java). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
 
     <application
         android:label="@string/app_name"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false">
         <activity
-            android:name=".MainActivity"
-            android:exported="true">
+            android:name=".SequenceActivity"
+            android:exported="true"
+            android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
         <activity
-            android:name=".SequenceActivity"
-            android:exported="false" />
+            android:name=".MainActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <!-- MainActivity ("Model lab") keeps its loaded photo and results
+             only in fields, so a rotation recreated it and lost them.
+             Locked to portrait like SequenceActivity. -->
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>
