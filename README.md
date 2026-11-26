@@ -7,6 +7,11 @@ the Cloud Run backend it talks to. The models' training code, datasets and
 offline testing live in GitHub A:
 https://github.com/Khagendra01/cs663-project-2-vision
 
+**Documentation Report (PDF):**
+[CS663_Project2_Results_Report_Group5.pdf](https://github.com/Khagendra01/cs663-project-2-vision/blob/main/docs/CS663_Project2_Results_Report_Group5.pdf).
+It covers the data, model results, system architecture, setup, testing, limits and how to reproduce
+everything. It is rebuilt from `docs/build_report.py` in GitHub A.
+
 The app watches a dog through the phone's camera and judges one training
 attempt: did the dog Sit / Down / Stand when told, or hold a Stay for the
 target time? It answers **SUCCESS**, **EARLY_BREAK** (with the second it
